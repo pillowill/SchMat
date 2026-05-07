@@ -1,0 +1,65 @@
+## 训练 simplified DSS-seq 自回归 LLM 的配置文件
+## 对应 train_cry2seq_simplified.py
+## 当前 token 模板默认不包含：<SPACE_GROUP_*>, <CRYSTAL_SYSTEM_*>, <COORD_*>
+
+# ===== 数据 =====
+dataset_dir: "dataset/mp_20/DSS-seqs_bg"   # 使用 cif2token_optimized.py 生成的简化 token 目录
+train_file: "train_tokens.pkl.gz"
+val_file: "val_tokens.pkl.gz"
+
+# ===== 输出 =====
+out_dir: "ckpts/mp_20/auto_regressive_m_bg/"
+
+# ===== 序列长度 =====
+max_seq_len: 256
+
+# ===== 训练超参 =====
+batch_size: 256
+num_epochs: 1000
+learning_rate: 1.0e-5
+weight_decay: 1.0e-7
+betas: [0.9, 0.95]
+grad_clip: 1.0
+num_workers: 0
+seed: 42
+
+# ===== GPT 模型结构 =====
+dropout: 0.2
+n_layer: 4
+n_head: 4
+n_embd: 256
+
+# ===== tokenizer / DSS-seq 词表配置 =====
+# 必须与 Attn-RVQ / cif2token 输出保持一致。
+# 你的样例里有 <GLOBAL_CODE_398>，因此 codebook_size 不能是 256，至少要 512。
+codebook_size: 512
+codebooksize_global: 512
+codebooksize_local: 512
+
+# 如果全局段每个结构输出 2 个 <GLOBAL_CODE_*>
+num_quantizers_global: 2
+
+# 如果每个 site 输出 3 个 <LOCAL_CODE_*>
+num_quantizers_local: 3
+
+# 必须覆盖数据集中最大的 <NUM_SITES_n> 和 <SITE_i>
+max_sites: 128
+
+# 当前简化模板关闭这三类 token
+include_space_group: false
+include_crystal_system: false
+include_coord: false
+
+# ===== 条件属性 token，可选 =====
+# 如果 dataset_dir 是 DSS-seqs_simplified_fe，则打开下面两项：
+# property_names: ["FORM_ENERGY"]
+# max_property_bins: 13
+property_names: ["BAND_GAP"]
+max_property_bins: 13
+
+# ===== early stopping =====
+early_stop_patience: 50
+early_stop_min_delta: 0.001
+save_last: true
+
+notes: "simplified DSS-seq without space group, crystal system, and coord tokens"
