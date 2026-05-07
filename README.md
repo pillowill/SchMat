@@ -32,14 +32,14 @@ Configs:
 
 Recommended: create from `schmat_env.yml` if available in your setup.
 
-```powershell
+```
 conda env create -f .\schmat_env.yml
 conda activate schmat
 ```
 
 Or with venv (minimal):
 
-```powershell
+```
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install pyyaml numpy tqdm torch torchvision torchaudio
@@ -57,8 +57,7 @@ pip install pyyaml numpy tqdm torch torchvision torchaudio
 
 ### Stage 1: Train Attn-RVQ
 
-```powershell
-$env:CUDA_VISIBLE_DEVICES = "0"
+```
 python .\train_attn_rvq.py --config .\config\attn_rvq\train_cryvqvae_mpts_52.yaml --save_dir .\ckpts\mpts_52\attn_rvq --wandb
 ```
 
@@ -68,14 +67,13 @@ Output: `best_model.pth` in `--save_dir`.
 
 1) Convert dataset to HDS token sequences using trained VQ model.
 
-```powershell
+```
 python .\scripts\cif2token.py --config .\config\ar_model\train_cry2seq.yaml
 ```
 
 2) Train AR schema model.
 
-```powershell
-$env:CUDA_VISIBLE_DEVICES = "0"
+```p
 python .\train_ar_model.py --config .\config\ar_model\train_cry2seq.yaml
 ```
 
@@ -83,8 +81,7 @@ Output: `best_cry2seq.pt` in AR output directory.
 
 ### Stage 3: Train conditional diffusion
 
-```powershell
-$env:CUDA_VISIBLE_DEVICES = "0"
+```
 python .\train_cond_diff.py --config .\config\cond_diffusion\train_cond_diffusion_mpts_52.yaml --save_dir .\ckpts\mpts_52\cond_diffusion --wandb
 ```
 
