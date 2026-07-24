@@ -69,7 +69,7 @@ class SelfAttention(nn.Module):
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
 
-    def forward(self, x: Tensor, attention_mask: Tensor = None) -> Tensor:
+    def forward(self, x: Tensor, attention_mask: Tensor = None, attention_mode: str = None) -> Tensor:
         """
         Applies causal or bidirectional self-attention to the given tensor.
 
@@ -77,6 +77,9 @@ class SelfAttention(nn.Module):
         :returns: result of applying the causal self-attention operation
         """
         B, T, C = x.size()  # batch size, sequence length, embedding dimensionality (n_embd)
+        is_causal = self.is_causal if attention_mode is None else attention_mode == "causal"
+        if attention_mode is not None and attention_mode not in {"causal", "bidirectional"}:
+            raise ValueError(f"Unsupported attention_mode: {attention_mode}")
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
@@ -96,12 +99,12 @@ class SelfAttention(nn.Module):
         if self.flash:
             y = torch.nn.functional.scaled_dot_product_attention(
                 q, k, v, attn_mask=key_padding_mask, dropout_p=self.dropout if self.training else 0.0,
-                is_causal=self.is_causal,
+                is_causal=is_causal,
             )
         else:
             # manual implementation of attention
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            if self.is_causal:
+            if is_causal:
                 att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
             if key_padding_mask is not None:
                 att = att + key_padding_mask
@@ -151,7 +154,7 @@ class Block(nn.Module):
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
-    def forward(self, x: Tensor, attention_mask: Tensor = None) -> Tensor:
+    def forward(self, x: Tensor, attention_mask: Tensor = None, attention_mode: str = None) -> Tensor:
         """
         Forward pass for the Transformer Block module. A Block module includes causal self-attention,
         layer normalization, and MLP, and residual connections.
@@ -159,7 +162,9 @@ class Block(nn.Module):
         :param x: input to the transformer block
         :returns: output of the transformer block, with the same shape as in the input
         """
-        x = x + self.attn(self.ln_1(x), attention_mask=attention_mask)
+        x = x + self.attn(
+            self.ln_1(x), attention_mask=attention_mask, attention_mode=attention_mode,
+        )
         x = x + self.mlp(self.ln_2(x))
         return x
 
@@ -227,7 +232,16 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None, stage_ids=None, head_stage_ids=None, loss_mask=None, attention_mask=None):
+    def forward(
+        self,
+        idx,
+        targets=None,
+        stage_ids=None,
+        head_stage_ids=None,
+        loss_mask=None,
+        attention_mask=None,
+        attention_mode=None,
+    ):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
@@ -242,10 +256,13 @@ class GPT(nn.Module):
                 raise ValueError("stage_ids are required when stage_specific_embeddings is enabled")
             x = x + self.stage_embeddings(stage_ids.clamp(0, self.config.num_rvq_stages))
         x = self.transformer.drop(x)
-        if attention_mask is None and self.config.attention_mode == "bidirectional":
+        effective_attention_mode = attention_mode or self.config.attention_mode
+        if effective_attention_mode not in {"causal", "bidirectional"}:
+            raise ValueError(f"Unsupported attention_mode: {effective_attention_mode}")
+        if attention_mask is None and effective_attention_mode == "bidirectional":
             attention_mask = idx != self.padding_token_id
         for block in self.transformer.h:
-            x = block(x, attention_mask=attention_mask)
+            x = block(x, attention_mask=attention_mask, attention_mode=effective_attention_mode)
         x = self.transformer.ln_f(x)
 
         logits = self.lm_head(x)
@@ -352,10 +369,13 @@ class GPT(nn.Module):
         max_new_tokens,
         temperature=1.0,
         top_k=None,
+        top_p=None,
         num_gens=1,
         forbidden_token_ids=None,
         eos_token_id=None,
         early_stop_eos=False,
+        stage_id_by_token=None,
+        head_stage_id_by_token=None,
     ):
         """
         从给定前缀 idx 继续自回归生成 token 序列。
@@ -396,7 +416,18 @@ class GPT(nn.Module):
             idx_cond = idx[:, -self.config.block_size :]
 
             # 前向得到最后一个位置的 logits
-            logits, _ = self(idx_cond)  # logits: (B, 1, vocab_size)
+            input_stage_ids = None
+            head_stage_ids = None
+            if stage_id_by_token is not None:
+                input_stage_ids = stage_id_by_token.to(device)[idx_cond]
+                if head_stage_id_by_token is not None:
+                    head_stage_ids = head_stage_id_by_token.to(device)[idx_cond]
+            elif self.stage_embeddings is not None:
+                raise ValueError("stage_id_by_token is required to generate from a stage-embedding model")
+
+            logits, _ = self(
+                idx_cond, stage_ids=input_stage_ids, head_stage_ids=head_stage_ids,
+            )  # logits: (B, 1, vocab_size)
             logits = logits[:, -1, :]  # (B, vocab_size)
 
             # 应用温度
@@ -412,6 +443,16 @@ class GPT(nn.Module):
                     torch.full_like(logits, float("-inf")),
                     logits,
                 )
+
+            if top_p is not None and 0.0 < top_p < 1.0:
+                sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
+                cumulative_probs = F.softmax(sorted_logits, dim=-1).cumsum(dim=-1)
+                remove_sorted = cumulative_probs > top_p
+                # Keep the first token that crosses the nucleus threshold.
+                remove_sorted[..., 1:] = remove_sorted[..., :-1].clone()
+                remove_sorted[..., 0] = False
+                remove_mask = torch.zeros_like(remove_sorted).scatter(1, sorted_indices, remove_sorted)
+                logits = logits.masked_fill(remove_mask, float("-inf"))
 
             # 可选：屏蔽不希望采样到的 token（如 <UNK>）
             if forbidden_token_ids is not None:

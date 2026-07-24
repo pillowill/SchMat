@@ -5,8 +5,9 @@ import gzip
 import json
 import pickle
 import math
+import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from tqdm import tqdm
@@ -27,6 +28,7 @@ def parse_args():
     parser.add_argument("--max_new_tokens", type=int, default=256, help="Max new tokens to generate after prompt")
     parser.add_argument("--temperature", type=float, default=1.0, help="Sampling temperature")
     parser.add_argument("--top_k", type=int, default=10, help="Top-k sampling (0 disables)")
+    parser.add_argument("--top_p", type=float, default=1.0, help="Nucleus sampling threshold; 1 disables it")
     parser.add_argument("--num_samples_per_prompt", type=int, default=1, help="How many sequences per prompt")
     parser.add_argument("--num_generations", type=int, default=0, help="If >0, generate this exact number of DSS-seqs (useful in --random_mode).")
     parser.add_argument("--max_prompts", type=int, default=0, help="If >0, limit number of prompts (debug)")
@@ -41,6 +43,10 @@ def parse_args():
     parser.add_argument("--allow_unk", action="store_true", help="Allow sampling <UNK>. Default is to suppress <UNK> for cleaner DSS outputs.")
     parser.add_argument("--early_stop_eos", action="store_true", help="Stop early when all sampled sequences hit <EOS>.")
     parser.add_argument("--use_smact_filter", action="store_true", help="Filter generated sequences by SMACT charge neutrality.")
+    parser.add_argument("--num_candidates", type=int, default=0, help="Keep this many canonical candidates per prompt (0 keeps all samples).")
+    parser.add_argument("--candidate_oversample", type=int, default=2, help="Generate this multiple before canonical de-duplication.")
+    parser.add_argument("--canonicalize_candidates", action="store_true", help="Canonicalize formula/site order before writing candidates.")
+    parser.add_argument("--deduplicate_candidates", action="store_true", help="Drop duplicate canonical HDS candidates per prompt.")
     return parser.parse_args()
 
 
@@ -86,6 +92,60 @@ def build_random_prompt_tokens(args) -> List[str]:
     return tokens
 
 
+def build_stage_maps(vocab) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Create embedding and output-head stage routes from the checkpoint vocab."""
+    input_stages = torch.zeros(len(vocab), dtype=torch.long)
+    head_stages = torch.zeros(len(vocab), dtype=torch.long)
+    stage_to_id = {
+        "GLOBAL_Q0": 1, "GLOBAL_Q1": 2,
+        "LOCAL_Q0": 3, "LOCAL_Q1": 4, "LOCAL_Q2": 5,
+    }
+    for token, token_id in vocab.token_to_id.items():
+        match = re.fullmatch(r"<(?:STAGE_)?(GLOBAL|LOCAL)_Q(\d+)>", token)
+        if not match:
+            match = re.fullmatch(r"<(GLOBAL|LOCAL)_CODE_Q(\d+)_\d+>", token)
+        if not match:
+            continue
+        stage_id = stage_to_id.get(f"{match.group(1)}_Q{match.group(2)}", 0)
+        input_stages[token_id] = stage_id
+        if token.startswith("<STAGE_"):
+            # A stage marker predicts the following code; ordinary code tokens
+            # predict syntax and therefore keep the shared output head.
+            head_stages[token_id] = stage_id
+    return input_stages, head_stages
+
+
+def canonicalize_candidate(tokens: List[str]) -> List[str]:
+    """Remove training-only markers and apply the shared canonical HDS order."""
+    from train_ar_model import canonicalize_hds_tokens
+
+    without_markers = [token for token in tokens if not token.startswith("<STAGE_")]
+    return canonicalize_hds_tokens(without_markers)
+
+
+def select_candidates(
+    candidates: List[Dict[str, Any]],
+    requested: int,
+    canonicalize: bool,
+    deduplicate: bool,
+) -> List[Dict[str, Any]]:
+    """Apply deterministic canonicalization, de-duplication and ordering."""
+    prepared = []
+    seen = set()
+    for candidate in candidates:
+        tokens = canonicalize_candidate(candidate["tokens"]) if canonicalize else candidate["tokens"]
+        key = tuple(tokens)
+        if deduplicate and key in seen:
+            continue
+        seen.add(key)
+        updated = dict(candidate)
+        updated["tokens"] = tokens
+        prepared.append(updated)
+    # Stable lexical order makes candidate indices reproducible across shards.
+    prepared.sort(key=lambda item: tuple(item["tokens"]))
+    return prepared[:requested] if requested > 0 else prepared
+
+
 def main():
     args = parse_args()
     device = torch.device(args.device if (args.device == "cpu" or torch.cuda.is_available()) else "cpu")
@@ -119,6 +179,11 @@ def main():
     forbidden_ids = [] if args.allow_unk else ([unk_id] if unk_id is not None else [])
 
     top_k: Optional[int] = args.top_k if args.top_k and args.top_k > 0 else None
+    top_p: Optional[float] = args.top_p if 0.0 < args.top_p < 1.0 else None
+    stage_id_by_token, head_stage_id_by_token = build_stage_maps(vocab)
+    samples_per_prompt = args.num_samples_per_prompt
+    if args.num_candidates > 0:
+        samples_per_prompt = args.num_candidates * max(1, args.candidate_oversample)
 
     results: List[Dict[str, Any]] = []
     n_read = 0
@@ -130,7 +195,7 @@ def main():
                 raise ValueError(f"Token '{t}' is not in checkpoint vocabulary. Please use a compatible cry2seq checkpoint.")
 
         target_n = args.num_generations if args.num_generations > 0 else 10000
-        batch_size = max(1, int(args.num_samples_per_prompt))
+        batch_size = max(1, int(samples_per_prompt))
         
         pbar = tqdm(desc="Generating (random_mode)", total=target_n, unit="gen")
         batch_idx = 0
@@ -144,10 +209,13 @@ def main():
                 max_new_tokens=args.max_new_tokens,
                 temperature=args.temperature,
                 top_k=top_k,
+                top_p=top_p,
                 num_gens=1,
                 forbidden_token_ids=forbidden_ids,
                 eos_token_id=eos_id,
                 early_stop_eos=args.early_stop_eos,
+                stage_id_by_token=stage_id_by_token,
+                head_stage_id_by_token=head_stage_id_by_token,
             )
 
             for j in range(gen_ids.size(0)):
@@ -225,12 +293,16 @@ def main():
                 max_new_tokens=args.max_new_tokens,
                 temperature=args.temperature,
                 top_k=top_k,
-                num_gens=args.num_samples_per_prompt,
+                top_p=top_p,
+                num_gens=samples_per_prompt,
                 forbidden_token_ids=forbidden_ids,
                 eos_token_id=eos_id,
                 early_stop_eos=args.early_stop_eos,
+                stage_id_by_token=stage_id_by_token,
+                head_stage_id_by_token=head_stage_id_by_token,
             )
 
+            prompt_candidates: List[Dict[str, Any]] = []
             for j in range(gen_ids.size(0)):
                 ids_j = gen_ids[j].tolist()
                 tokens_j = tokenizer.decode(ids_j)
@@ -251,7 +323,7 @@ def main():
                     if not is_valid:
                         continue
 
-                results.append(
+                prompt_candidates.append(
                     {
                         "id": f"{prompt_id}__gen_{j}",
                         "prompt_id": prompt_id,
@@ -260,6 +332,15 @@ def main():
                         "tokens": tokens_j,
                     }
                 )
+
+            results.extend(
+                select_candidates(
+                    prompt_candidates,
+                    requested=args.num_candidates,
+                    canonicalize=args.canonicalize_candidates,
+                    deduplicate=args.deduplicate_candidates,
+                )
+            )
 
             n_read += 1
             pbar.set_postfix(

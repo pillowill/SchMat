@@ -10,6 +10,8 @@ train_ar_model.py
 
 import argparse
 import gzip
+import hashlib
+import json
 import os
 import pickle
 from pathlib import Path
@@ -171,6 +173,252 @@ class CrystalTokenDataset(Dataset):
         return input_ids, target_ids, stage_ids, stage_ids, loss_mask
 
 
+CACHE_FORMAT_VERSION = 1
+
+
+def _strip_trailing_pad_tokens(tokens: Sequence[str]) -> List[str]:
+    """Remove source-file padding before applying semantic HDS transforms."""
+    end = len(tokens)
+    while end > 0 and tokens[end - 1] == "<PAD>":
+        end -= 1
+    return list(tokens[:end])
+
+
+def prepare_hds_cache_tokens(
+    tokens: Sequence[str],
+    canonicalize: bool,
+    stage_marked: bool,
+) -> List[str]:
+    """Build the stable, unpadded token stream stored by the prepared cache."""
+    prepared = _strip_trailing_pad_tokens(tokens)
+    if canonicalize:
+        prepared = canonicalize_hds_tokens(prepared)
+    if stage_marked:
+        prepared = stage_mark_hds_tokens(prepared)
+    return prepared
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def default_hds_cache_dir(dataset_dir: Path, vocab_cfg, args) -> Path:
+    """Place derived tensors beside, never inside, the immutable direct HDS."""
+    name = (
+        f"canonical{int(args.canonicalize_hds)}_stage{int(args.stage_marked)}_"
+        f"g{vocab_cfg.num_quantizers_global}_l{vocab_cfg.num_quantizers_local}_"
+        f"k{vocab_cfg.codebooksize_global}_{vocab_cfg.codebooksize_local}_"
+        f"max{args.max_seq_len}"
+    )
+    return dataset_dir.parent / "prepared_hds" / name
+
+
+def _cache_manifest(
+    cache_dir: Path,
+    source_paths: Dict[str, Path],
+    vocab_cfg,
+    args,
+) -> Dict[str, Any]:
+    return {
+        "format_version": CACHE_FORMAT_VERSION,
+        "cache_dir": str(cache_dir),
+        "source_files": {
+            split: {"path": str(path), "sha256": _file_sha256(path)}
+            for split, path in source_paths.items()
+        },
+        "vocab_config": vocab_cfg.__dict__,
+        "transform": {
+            "canonicalize_hds": bool(args.canonicalize_hds),
+            "stage_marked": bool(args.stage_marked),
+            "stage_marker_schema": list(RVQ_STAGE_NAMES),
+            "max_seq_len": int(args.max_seq_len),
+        },
+    }
+
+
+def build_hds_tensor_cache(
+    cache_dir: Path,
+    split_samples: Dict[str, List[Dict[str, Any]]],
+    source_paths: Dict[str, Path],
+    tokenizer,
+    vocab_cfg,
+    args,
+) -> None:
+    """Materialize canonical/stage-marked HDS tensors once for future training.
+
+    The cache stores only full token/stage sequences.  Causal shifts and any
+    future masked corruption remain cheap runtime operations, so one cache can
+    serve both objectives with the same vocabulary configuration.
+    """
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    sequence_size = int(args.max_seq_len) + 1
+    pad_id = tokenizer.vocab.token_to_id["<PAD>"]
+    unk_id = tokenizer.vocab.token_to_id["<UNK>"]
+
+    for split, samples in split_samples.items():
+        # int32 is supported by the server's PyTorch serialization.  uint16
+        # would be smaller but is not portable across the installed runtime.
+        token_ids = torch.full((len(samples), sequence_size), pad_id, dtype=torch.int32)
+        stage_ids = torch.zeros((len(samples), sequence_size), dtype=torch.uint8)
+        lengths = torch.zeros(len(samples), dtype=torch.int32)
+        sample_ids: List[str] = []
+        too_long: List[Tuple[str, int]] = []
+
+        for row, sample in enumerate(samples):
+            sample_id = str(sample.get("id", row))
+            tokens = prepare_hds_cache_tokens(
+                sample.get("tokens", []),
+                canonicalize=bool(args.canonicalize_hds),
+                stage_marked=bool(args.stage_marked),
+            )
+            encoded = tokenizer.encode(tokens)
+            if len(tokens) != len(encoded):
+                raise RuntimeError(f"Tokenizer length mismatch for id={sample_id}")
+            unknown = [token for token, token_id in zip(tokens, encoded) if token_id == unk_id and token != "<UNK>"]
+            if unknown:
+                raise ValueError(f"Cache build found unknown tokens for id={sample_id}: {unknown[:5]}")
+            if len(encoded) > sequence_size:
+                too_long.append((sample_id, len(encoded)))
+                continue
+
+            length = len(encoded)
+            if length:
+                token_ids[row, :length] = torch.tensor(encoded, dtype=torch.int32)
+                stage_ids[row, :length] = torch.tensor(build_stage_ids(tokens), dtype=torch.uint8)
+            lengths[row] = length
+            sample_ids.append(sample_id)
+
+        if too_long:
+            preview = ", ".join(f"{sample_id}:{length}" for sample_id, length in too_long[:10])
+            raise ValueError(
+                f"{split} has {len(too_long)} HDS records longer than the cache limit "
+                f"({sequence_size} tokens after transforms): {preview}"
+            )
+        if len(sample_ids) != len(samples):
+            raise RuntimeError(f"Cache record count mismatch for split={split}")
+
+        payload = {
+            "format_version": CACHE_FORMAT_VERSION,
+            "split": split,
+            "token_ids": token_ids,
+            "stage_ids": stage_ids,
+            "lengths": lengths,
+            "sample_ids": sample_ids,
+        }
+        output_path = cache_dir / f"{split}.pt"
+        temporary_path = output_path.with_suffix(".pt.tmp")
+        torch.save(payload, temporary_path)
+        temporary_path.replace(output_path)
+        print(f"[Cache] wrote {split}: {len(samples)} records -> {output_path}")
+
+    manifest_path = cache_dir / "manifest.json"
+    temporary_manifest = manifest_path.with_suffix(".json.tmp")
+    temporary_manifest.write_text(
+        json.dumps(_cache_manifest(cache_dir, source_paths, vocab_cfg, args), indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    temporary_manifest.replace(manifest_path)
+    print(f"[Cache] manifest -> {manifest_path}")
+
+
+def validate_hds_tensor_cache(
+    cache_dir: Path,
+    vocab_cfg,
+    args,
+    source_paths: Optional[Dict[str, Path]] = None,
+) -> Dict[str, Any]:
+    """Reject stale tensors instead of silently training with a mismatched vocab."""
+    manifest_path = cache_dir / "manifest.json"
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"HDS cache manifest not found: {manifest_path}")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if manifest.get("format_version") != CACHE_FORMAT_VERSION:
+        raise ValueError("Unsupported HDS cache format version")
+    expected_transform = {
+        "canonicalize_hds": bool(args.canonicalize_hds),
+        "stage_marked": bool(args.stage_marked),
+        "stage_marker_schema": list(RVQ_STAGE_NAMES),
+        "max_seq_len": int(args.max_seq_len),
+    }
+    if manifest.get("transform") != expected_transform:
+        raise ValueError("HDS cache transform does not match the requested training configuration")
+    if manifest.get("vocab_config") != vocab_cfg.__dict__:
+        raise ValueError("HDS cache vocabulary does not match the requested training configuration")
+    if source_paths:
+        for split, path in source_paths.items():
+            cached_source = manifest.get("source_files", {}).get(split)
+            if cached_source is None:
+                raise ValueError(f"HDS cache has no source signature for split={split}")
+            if cached_source.get("sha256") != _file_sha256(path):
+                raise ValueError(f"HDS cache is stale for split={split}; rebuild it before training")
+    return manifest
+
+
+class CachedCrystalTokenDataset(Dataset):
+    """Read-only counterpart to :class:`CrystalTokenDataset` for tensor caches.
+
+    This class is deliberately not selected by default.  It is an interface for
+    a later opt-in training run after cache integrity has been validated.
+    """
+
+    def __init__(
+        self,
+        cache_path: Path,
+        tokenizer,
+        max_seq_len: int,
+        objective: str = "causal",
+        mask_probability: float = 0.15,
+        protected_token_ids: Optional[Sequence[int]] = None,
+    ):
+        if objective not in {"causal", "masked"}:
+            raise ValueError(f"Unsupported HDS objective: {objective}")
+        payload = torch.load(cache_path, map_location="cpu", weights_only=False)
+        if payload.get("format_version") != CACHE_FORMAT_VERSION:
+            raise ValueError(f"Unsupported cache payload: {cache_path}")
+        self.token_ids = payload["token_ids"]
+        self.stage_ids = payload["stage_ids"]
+        self.lengths = payload["lengths"]
+        self.max_seq_len = max_seq_len
+        self.objective = objective
+        self.mask_probability = mask_probability
+        self.pad_id = tokenizer.vocab.token_to_id["<PAD>"]
+        self.mask_id = tokenizer.vocab.token_to_id.get("<MASK>")
+        self.protected_token_ids = set(protected_token_ids or []) | {self.pad_id}
+        if objective == "masked" and self.mask_id is None:
+            raise ValueError("Masked-HDS requires <MASK> in the tokenizer vocabulary")
+        if self.token_ids.shape[1] != max_seq_len + 1:
+            raise ValueError(f"Cache sequence length mismatch in {cache_path}")
+
+    def __len__(self) -> int:
+        return int(self.token_ids.shape[0])
+
+    def __getitem__(self, idx: int):
+        ids = self.token_ids[idx].to(dtype=torch.long)
+        stages = self.stage_ids[idx].to(dtype=torch.long)
+        if self.objective == "causal":
+            return ids[:-1], ids[1:], stages[:-1], stages[1:], torch.ones_like(ids[:-1], dtype=torch.bool)
+
+        ids = ids[:self.max_seq_len]
+        stages = stages[:self.max_seq_len]
+        target_ids = ids.clone()
+        candidate = torch.ones_like(ids, dtype=torch.bool)
+        for protected_id in self.protected_token_ids:
+            candidate &= ids != protected_id
+        candidate_indices = candidate.nonzero(as_tuple=False).flatten()
+        if len(candidate_indices) == 0:
+            raise ValueError("Masked-HDS cache record has no maskable tokens")
+        loss_mask = (torch.rand(len(ids)) < self.mask_probability) & candidate
+        if not loss_mask.any():
+            loss_mask[candidate_indices[torch.randint(len(candidate_indices), (1,))]] = True
+        input_ids = ids.clone()
+        input_ids[loss_mask] = int(self.mask_id)
+        return input_ids, target_ids, stages, stages, loss_mask
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Train crystal_token_gpt on crystal VQ token sequences")
     parser.add_argument(
@@ -196,6 +444,12 @@ def parse_args():
         type=str,
         default="val_tokens.pkl.gz",
         help="验证集 token 文件名（默认: val_tokens.pkl.gz）",
+    )
+    parser.add_argument(
+        "--test_file",
+        type=str,
+        default="test_tokens.pkl.gz",
+        help="Optional test token file used only by --prepare_hds_cache.",
     )
     parser.add_argument(
         "--out_dir",
@@ -411,6 +665,22 @@ def parse_args():
         default=5,
         help="Target number of canonical HDS candidates for downstream generation metadata.",
     )
+    parser.add_argument(
+        "--prepare_hds_cache",
+        action="store_true",
+        help="Build canonical/stage tensor cache and exit without starting model training.",
+    )
+    parser.add_argument(
+        "--hds_cache_dir",
+        type=str,
+        default=None,
+        help="Prepared HDS cache directory. Defaults to a sibling of dataset_dir.",
+    )
+    parser.add_argument(
+        "--use_hds_cache",
+        action="store_true",
+        help="Opt in to loading prepared tensors for training. Disabled by default.",
+    )
     args = parser.parse_args()
 
     # YAML config support (optional)
@@ -428,6 +698,7 @@ def parse_args():
             "dataset_dir": None,
             "train_file": "train_tokens.pkl.gz",
             "val_file": "val_tokens.pkl.gz",
+            "test_file": "test_tokens.pkl.gz",
             "out_dir": "ckpts/cry2seq",
             "max_seq_len": 512,
             "batch_size": 32,
@@ -464,6 +735,9 @@ def parse_args():
             "stage_specific_heads": False,
             "canonicalize_hds": False,
             "num_candidates": 5,
+            "prepare_hds_cache": False,
+            "hds_cache_dir": None,
+            "use_hds_cache": False,
         }
 
         # CLI override for list-like property names
@@ -640,6 +914,35 @@ def main():
         )
 
     max_seq_len = args.max_seq_len
+    cache_dir = Path(args.hds_cache_dir) if args.hds_cache_dir else default_hds_cache_dir(dataset_dir, vocab_cfg, args)
+
+    if args.prepare_hds_cache:
+        split_samples: Dict[str, List[Dict[str, Any]]] = {
+            "train": train_samples,
+            "val": val_samples,
+        }
+        source_paths: Dict[str, Path] = {
+            "train": train_path,
+            "val": val_path,
+        }
+        test_path = dataset_dir / args.test_file
+        if test_path.is_file():
+            print(f"Loading test tokens from {test_path}")
+            split_samples["test"] = load_pickle(str(test_path))
+            source_paths["test"] = test_path
+        else:
+            print(f"[Cache] test token file not found; caching train/val only: {test_path}")
+
+        build_hds_tensor_cache(
+            cache_dir=cache_dir,
+            split_samples=split_samples,
+            source_paths=source_paths,
+            tokenizer=tokenizer,
+            vocab_cfg=vocab_cfg,
+            args=args,
+        )
+        print("[Cache] preparation complete; normal training remains disabled for this command.")
+        return
 
     # ===== Dataset / DataLoader =====
     # Structural delimiters are context anchors, not reconstruction targets in
@@ -659,8 +962,33 @@ def main():
         mask_probability=args.masked_probability,
         protected_token_ids=protected_token_ids,
     )
-    train_dataset = CrystalTokenDataset(train_samples, **dataset_kwargs)
-    val_dataset = CrystalTokenDataset(val_samples, **dataset_kwargs)
+    if args.use_hds_cache:
+        validate_hds_tensor_cache(
+            cache_dir,
+            vocab_cfg,
+            args,
+            source_paths={"train": train_path, "val": val_path},
+        )
+        print(f"[Cache] reading prepared tensors from {cache_dir}")
+        train_dataset = CachedCrystalTokenDataset(
+            cache_dir / "train.pt",
+            tokenizer=tokenizer,
+            max_seq_len=max_seq_len,
+            objective=args.objective,
+            mask_probability=args.masked_probability,
+            protected_token_ids=protected_token_ids,
+        )
+        val_dataset = CachedCrystalTokenDataset(
+            cache_dir / "val.pt",
+            tokenizer=tokenizer,
+            max_seq_len=max_seq_len,
+            objective=args.objective,
+            mask_probability=args.masked_probability,
+            protected_token_ids=protected_token_ids,
+        )
+    else:
+        train_dataset = CrystalTokenDataset(train_samples, **dataset_kwargs)
+        val_dataset = CrystalTokenDataset(val_samples, **dataset_kwargs)
 
     train_loader = DataLoader(
         train_dataset,
