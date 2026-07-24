@@ -1,0 +1,57 @@
+# MP-20 experiment: alpha-weighted Attn-RVQ with a 256-entry codebook.
+# This experiment-specific config leaves the baseline MP-20 config untouched.
+
+wandb:
+  project: crystal-attvqvae
+  run_name: mp_20_attn_rvq_k256_lr3e-4
+
+# Dataset
+dataset_name: mp_20
+use_single_csv: false
+data_path: dataset/mp_20
+train_csv: train.csv
+val_csv: val.csv
+test_csv: test.csv
+property: band_gap
+
+# CSPNet encoder and alpha-weighted attention residual VQ.
+hidden_dim: 512
+num_layers: 6
+codebook_size: 256
+num_quantizers: 1
+num_quantizers_global: 2
+num_quantizers_local: 3
+vq_type: residual_attn
+commitment_weight: 0.5
+
+# Stage-aware attention aggregation used by Attn-RVQ.
+aggregator_dropout: 0.2
+aggregator_attn_dropout: 0.2
+aggregator_use_positional: true
+aggregator_positional_scale: 1.0
+residual_use_outer_aggregator: false
+residual_attn_use_outer_aggregator: false
+
+# Train the space-group auxiliary head. Crystal-system tokens are not part of
+# this model/config and remain disabled in the HDS representation.
+num_space_groups: 230
+max_cn: 20
+num_elements: 104
+loss_weights:
+  recon_global: 1.0
+  recon_local: 1.0
+  space_group: 1.0
+  cn: 1.0
+  commitment: 0.5
+
+# Training. 640 reached the 8 GB limit on a high-atom-count batch; 512 is the
+# requested safe batch size for the full MP-20 training run.
+num_epochs: 100
+batch_size: 512
+learning_rate: 3.0e-4
+weight_decay: 1.0e-4
+min_lr: 1.0e-5
+grad_clip: 1.0
+workers: 0
+random_seed: 42
+save_every: 10

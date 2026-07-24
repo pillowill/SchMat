@@ -1,0 +1,76 @@
+# CrystalVQVAE 训练配置文件
+
+# ==================== Wandb Configuration ====================
+wandb:
+  project: crystal-attvqvae              # Wandb 项目名
+  run_name: mpts_52_0.0.6_VQ             # Wandb run 名（null 表示自动生成）
+
+# ========== 数据配置 ==========
+use_single_csv: false
+csv_file: data.csv
+train_ratio: 0.8               # 训练集比例
+val_ratio: 0.1                 # 验证集比例（剩下 0.1 预留为 test）
+data_path: "dataset/mpts_52"         # 数据集根目录（包含 train/val/test CSV 和 atom_init.json）
+train_csv: "train.csv"             # 训练集 CSV
+val_csv: "val.csv"                 # 验证集 CSV
+test_csv: "test.csv"               # 测试集 CSV（当前脚本未使用，可留作评估）
+property: "formation_energy"       # 属性名称（CIFData 内部会映射为 formation_energy_per_atom）
+
+# ========== 模型配置 ==========
+# CSPNet encoder
+hidden_dim: 512  # 隐藏层维度
+num_layers: 6    # CSPNet 层数
+
+## 预训练 CSP 编码器初始化（可选）
+#pretrained_csp_path: "ckpts/diffcsp/best_model.pth"  # 改成你的实际 checkpoint 文件
+#freeze_pretrained_csp: true  # 默认冻结，不进行微调
+
+# Vector Quantization (ResidualVQ)
+codebook_size: 512  # codebook 大小
+num_quantizers: 1   # ResidualVQ 的量化器数量（向后兼容，当 num_quantizers_global/local 未设置时使用）
+num_quantizers_global: 2  # 全局量化器数量（null 表示使用 num_quantizers）
+num_quantizers_local: 3   # 局部量化器数量（null 表示使用 num_quantizers）
+vq_type: 'vector'  # 每一级 residual 更新使用 attention 门控加权
+commitment_weight: 0.5  # VQ commitment loss 权重（采用 EMA 更新码本，不使用 commitment）
+# CodebookAttentionAggregator
+aggregator_dropout: 0.2  # 注意力聚合器 dropout
+aggregator_attn_dropout: 0.2
+aggregator_use_positional: true
+aggregator_positional_scale: 1.0
+residual_use_outer_aggregator: false
+residual_attn_use_outer_aggregator: false
+
+# 语义解码器
+num_space_groups: 230   # 空间群数量
+max_cn: 20              # 最大配位数
+num_elements: 104       # 元素种类数（103 种真实元素 + 1 个 dummy，占位）
+
+# 损失权重
+loss_weights:
+  recon_global: 1.0    # 全局语义重建损失权重
+  recon_local: 1.0     # 局部语义重建损失权重
+  space_group: 1    # 空间群预测损失权重（辅助任务）
+  cn: 1             # 配位数预测损失权重（辅助任务）
+#  neighbor: 0.5        # 邻居元素预测损失权重（辅助任务）
+  commitment: 0.5    # VQ commitment 损失权重
+
+# ========== 训练配置 ==========
+num_epochs: 100  # 训练轮数
+batch_size: 64  # 批次大小
+learning_rate: 1.0e-4  # 初始学习率
+weight_decay: 1.0e-5  # 权重衰减
+min_lr: 1.0e-7  # 最小学习率
+grad_clip: 1.0  # 梯度裁剪
+
+# 数据加载
+workers: 0          # DataLoader 工作进程数
+random_seed: 42     # 随机种子
+
+# 保存配置
+save_every: 50  # 每N个epoch保存一次检查点
+
+# ========== 示例使用 ==========
+# python train_attn_rvq.py --config config/train_cryvqvae_mpts_52.yaml --save_dir checkpoints/mp_20
+# CUDA_VISIBLE_DEVICES=0 python train_attn_rvq.py --config config/data/train_cryvqvae_mpts_52.yaml --data_path dataset/mpts_52 --save_dir ./ckpts/mpts_52/attn_rvq --wandb
+
+

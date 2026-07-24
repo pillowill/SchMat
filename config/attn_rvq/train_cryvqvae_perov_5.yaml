@@ -1,0 +1,80 @@
+# CrystalVQVAE 训练配置文件
+
+# ==================== Wandb Configuration ====================
+wandb:
+  project: crystal-attvqvae              # Wandb 项目名
+  run_name: perov_5_0.0.6_VQ             # Wandb run 名（null 表示自动生成）
+
+# ========== 数据配置 ==========
+use_single_csv: false
+csv_file: data.csv
+train_ratio: 0.8               # 训练集比例
+val_ratio: 0.1                 # 验证集比例（剩下 0.1 预留为 test）
+data_path: "dataset/perov_5"         # 数据集根目录（包含 train/val/test CSV 和 atom_init.json）
+train_csv: "train.csv"             # 训练集 CSV
+val_csv: "val.csv"                 # 验证集 CSV
+test_csv: "test.csv"               # 测试集 CSV（当前脚本未使用，可留作评估）
+property: "formation_energy"       # 属性名称（CIFData 内部会映射为 formation_energy_per_atom）
+
+# ========== 模型配置 ==========
+# CSPNet encoder
+hidden_dim: 512  # 隐藏层维度
+num_layers: 6    # 与 mpts_52 对齐
+
+# Vector Quantization / ResidualVQ
+codebook_size: 512
+num_quantizers: 1
+num_quantizers_global: 2
+num_quantizers_local: 3
+commitment_weight: 0.5
+vq_type: 'residual_attn'  # 每一级 residual 更新使用 attention 门控加权
+
+# CodebookAttentionAggregator
+vaggregator_dropout: 0.2  # 注意力聚合器 dropout
+aggregator_attn_dropout: 0.2
+aggregator_use_positional: true
+aggregator_positional_scale: 1.0
+residual_use_outer_aggregator: false
+residual_attn_use_outer_aggregator: false
+
+## Residual VQ codebook optional parameters (effective only when vq_type is residual/residual_attn)
+#enable_residual_codebook_params: false
+#residual_codebook_params:
+#  shared_codebook: true
+#  kmeans_init: true
+#  kmeans_iters: 10
+
+# 语义解码器
+num_space_groups: 230
+max_cn: 20
+num_elements: 104
+
+# 损失权重（与 mpts_52 风格对齐）
+loss_weights:
+  recon_global: 1.0
+  recon_local: 1.0
+  space_group: 1
+  cn: 1
+  # neighbor: 0.5
+  commitment: 0.5
+
+# ========== 训练配置 ==========
+num_epochs: 100
+batch_size: 512
+learning_rate: 1.0e-4
+weight_decay: 1.0e-5
+min_lr: 1.0e-7
+grad_clip: 1.0
+
+# 数据加载
+workers: 0
+random_seed: 42
+
+# 保存配置
+save_every: 50
+
+# ========== 示例使用 ==========
+# python train_attn_rvq.py --config config/train_cryvqvae_mpts_52.yaml --save_dir checkpoints/mp_20
+# python train_attn_rvq.py --config config/train_cryvqvae_mpts_52.yaml --data_path dataset/perov_5 --wandb
+# CUDA_VISIBLE_DEVICES=1 python train_attn_rvq.py --config config/data/train_cryvqvae_perov_5.yaml --save_dir ./ckpts/perov_5/attn_rvq --wandb --world_size 1
+

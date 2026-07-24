@@ -1,0 +1,80 @@
+# CrystalVQVAE 训练配置文件
+
+# ==================== Wandb Configuration ====================
+wandb:
+  project: crystal-attvqvae              # Wandb 项目名
+  run_name: mp_20_0.0.6_MinaRVQ
+  # Wandb run 名（null 表示自动生成）
+
+# ========== 数据配置 ==========
+dataset_name: mp_20
+use_single_csv: false
+csv_file: data.csv
+train_ratio: 0.8               # 训练集比例
+val_ratio: 0.1                 # 验证集比例（剩下 0.1 预留为 test）
+data_path: "dataset/mp_20"         # 数据集根目录（包含 train/val/test CSV 和 atom_init.json）
+train_csv: "train.csv"             # 训练集 CSV
+val_csv: "val.csv"                 # 验证集 CSV
+test_csv: "test.csv"               # 测试集 CSV（当前脚本未使用，可留作评估）
+property: "band_gap"       # 属性名称（CIFData 内部会映射为 formation_energy_per_atom）
+
+# ========== 模型配置 ==========
+# CSPNet encoder
+hidden_dim: 512  # 隐藏层维度
+num_layers: 6    # 与 mpts_52 配置对齐的 CSPNet 层数
+
+
+# Vector Quantization / ResidualVQ
+codebook_size: 512      # codebook 大小
+num_quantizers: 1       # ResidualVQ 的量化器数量（向后兼容，当 num_quantizers_global/local 未设置时使用）
+num_quantizers_global: 2  # 全局量化器数量
+num_quantizers_local: 3   # 局部量化器数量
+vq_type: 'residual_attn'  # 每一级 residual 更新使用 attention 门控加权
+commitment_weight: 0.5    # VQ commitment loss 权重
+
+# CodebookAttentionAggregator
+aggregator_dropout: 0.2  # 注意力聚合器 dropout（与 mpts_52 一致）
+aggregator_attn_dropout: 0.2
+aggregator_use_positional: true
+aggregator_positional_scale: 1.0
+residual_use_outer_aggregator: false
+residual_attn_use_outer_aggregator: false
+
+# 语义解码器
+num_space_groups: 230   # 空间群数量
+max_cn: 20              # 最大配位数
+num_elements: 104       # 元素种类数（与 mpts_52 一致）
+
+# 损失权重（与 mpts_52 风格对齐）
+loss_weights:
+  recon_global: 1    # 全局语义重建损失权重
+  recon_local: 1     # 局部语义重建损失权重
+  space_group: 1     # 空间群预测损失权重（辅助任务）
+  cn: 1              # 配位数预测损失权重（辅助任务）
+  # neighbor: 0.5        # 邻居元素预测损失权重（辅助任务，如需启用可取消注释）
+  commitment: 0.5      # VQ commitment 损失权重
+
+## Pretrained CSP encoder init
+#pretrained_csp_path: "ckpts/diffcsp/mp_csp/last.ckpt"
+#freeze_pretrained_csp: true
+
+# ========== 训练配置 ==========
+num_epochs: 100      # 训练轮数
+batch_size: 512      # 批次大小
+learning_rate: 1.0e-3  # 初始学习率
+weight_decay: 1.0e-4   # 权重衰减
+min_lr: 1.0e-5         # 最小学习率（与 mpts_52 对齐）
+grad_clip: 1.0         # 梯度裁剪
+#aux_warmup_epochs: 10  # 前10轮逐步引入辅助任务损失
+#aux_warmup_start_factor: 0.2
+
+# 数据加载
+workers: 0          # DataLoader 工作进程数
+random_seed: 42     # 随机种子
+
+# 保存配置
+save_every: 50  # 每N个 step/epoch 保存一次检查点（与 mpts_52 对齐）
+
+# ========== 示例使用 ==========
+# CUDA_VISIBLE_DEVICES=1 python train_attn_rvq.py --config config/data/train_cryvqvae_prep.yaml --save_dir ./ckpts/mp_20/attcryvqvae --wandb
+

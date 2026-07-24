@@ -1,0 +1,118 @@
+# 运行命令示例：
+#   python train_cond_diff.py --config config/train_cond_diffusion_carbon_24.yaml --save_dir ckpts/mp_20/cond_diffusion
+#   启用 wandb: CUDA_VISIBLE_DEVICES=1 python train_cond_diff.py --config config/train_cond_diffusion_carbon_24.yaml --wandb
+
+# ==================== Wandb Configuration ====================
+wandb:
+  project: cond_diffusion              # Wandb 项目名
+  run_name: carbon_24_0.0.6_RVQ                           # Wandb run 名（null 表示自动生成）
+
+# ==================== Data Configuration ====================
+use_single_csv: false
+data_path: dataset/carbon_24                    # 数据根目录，包含 train/val/test CSV
+train_csv: train.csv                        # 训练集 CSV 文件名
+val_csv: val.csv                            # 验证集 CSV 文件名
+test_csv: test.csv                          # 测试集 CSV 文件名
+return_test: false                          # 是否加载测试集 DataLoader
+property: formation_energy                  # CIFData 使用的性质键
+random_seed: 42                             # 随机种子
+
+# ==================== DataLoader Configuration ====================
+train_batch_size: 512                       # 训练集 batch_size
+val_batch_size: 128                         # 验证集 batch_size
+test_batch_size: 128                        # 测试集 batch_size
+workers: 0                                  # 数据加载线程数
+pin_memory: true                            # DataLoader 是否 pin_memory
+
+# ==================== Pretrained Model ====================
+pretrained_vqvae_path: ckpts/carbon_24/attn_rvq-RVQ/best_model.pth  # 预训练 CrystalVQVAE 权重路径
+pretrained_vqvae_config: config/attn_rvq/train_cryvqvae_carbon_24.yaml  # 训练该 VQVAE 时使用的 yaml 配置（用于匹配架构）
+
+use_gpt_precomputed_vq_vectors: false
+gpt_indices_path_train: null
+gpt_indices_path_val: null
+gpt_indices_path_test: null
+gpt_indices_dir: null
+filter_skipped_ids_before_training: false
+
+# ==================== Optimization ====================
+learning_rate: 1.0e-2                       # 学习率
+# ==================== Scheme A: finetune VQ-VAE aggregators only ====================
+finetune_vqvae_aggregator: false            # 只联合微调 VQ-VAE 的注意力聚合器（其余 VQ-VAE 参数冻结）
+vqvae_agg_lr: 1.0e-6                        # 聚合器学习率（建议 < learning_rate，例如 learning_rate * 0.1）
+weight_decay: 0                        # 权重衰减
+min_lr: 1.0e-7                              # 学习率最小值（CosineAnnealingLR）
+num_epochs: 4000                              # 训练轮数（最大训练轮数，early stopping 可能提前结束）
+grad_clip: 1.0                              # 梯度裁剪（None 表示不裁剪）
+
+# ==================== Learning Rate Scheduler ====================
+scheduler: cosine                            # 学习率调度器：cosine, plateau, step, constant
+# CosineAnnealingLR 参数
+cosine_T_max: null                          # CosineAnnealingLR 的 T_max（null 表示使用 num_epochs）
+# ReduceLROnPlateau 参数
+plateau_mode: min                           # ReduceLROnPlateau 的模式：min, max
+plateau_factor: 0.5                         # ReduceLROnPlateau 的学习率衰减因子
+plateau_patience: 10                        # ReduceLROnPlateau 的 patience
+plateau_threshold: 1e-4                     # ReduceLROnPlateau 的阈值
+plateau_cooldown: 0                         # ReduceLROnPlateau 的 cooldown
+# StepLR 参数
+step_size: 30                               # StepLR 的 step_size
+step_gamma: 0.1                             # StepLR 的 gamma
+
+# ==================== Early Stopping ====================
+early_stopping: false                        # 是否启用 early stopping
+early_stopping_patience: 20000000                 # Early stopping 的 patience（验证损失不改善的轮数）
+early_stopping_min_delta: 0.0001               # Early stopping 的最小改善阈值
+early_stopping_mode: min                    # Early stopping 的模式：min（验证损失越小越好）, max（验证指标越大越好）
+
+# ==================== Checkpoint Saving ====================
+save_every: 500                              # 每 N 个 epoch 保存一次检查点（0 表示不保存定期检查点）
+
+# ==================== Diffusion Process ====================
+timesteps: 1000                             # 扩散时间步数
+beta_schedule: cosine                        # Beta 调度方式：linear, cosine
+diffuse_atom_types: false                    # 是否扩散原子类型
+                                              #   true: 同时扩散原子类型、晶格和坐标（使用 D3PM）
+                                              #   false: 只扩散晶格和坐标，原子类型固定（类似 DiffCSP）
+max_atoms: 24                              # 103 atoms + 1 for dummy atom
+                                              # 最大原子数（D3PM，仅在 diffuse_atom_types=true 时使用）
+d3pm_hybrid_coeff: 1.0                      # D3PM 混合系数（0.0 表示只用 VB loss，仅在 diffuse_atom_types=true 时使用）
+
+# ==================== Conditional Guidance ====================
+cond_guide: true                            # 启用条件引导（必须为 true）
+cond_drop_prob: 0.2                         # 条件 drop 概率（用于 classifier-free guidance）
+
+# ==================== Model Architecture ====================
+# Time embedding
+time_dim: 512                               # 时间嵌入维度
+
+# CSPNet Decoder
+hidden_dim: 512                             # 隐藏层维度
+cond_dim: 512                               # 条件嵌入维度（应与预训练 VQVAE 的 hidden_dim 匹配）
+num_layers: 6                               # CSPNet 层数
+act_fn: silu                                # 激活函数：silu, relu
+dis_emb: sin                                # 距离嵌入：sin, none
+num_freqs: 128                               # 位置编码频率数
+edge_style: fc                              # 边连接方式：fc (全连接), knn
+cutoff: 6.0                                 # 邻居搜索截断半径（knn 模式）
+max_neighbors: 20                           # 最大邻居数（knn 模式）
+ln: true                                   # 是否使用 LayerNorm
+ip: true                                    # 是否使用不变点（equivariant features）
+smooth: false                                # 是否使用平滑激活
+                                              #   true: 同时扩散原子类型、晶格和坐标
+                                              #   false: 只扩散晶格和坐标，原子类型固定
+#smooth=True 只在你把 atom_types 作为 one-hot（形状 [N, max_atoms] 的实值向量）输入时才适用。代码里：
+#smooth=True -> self.node_embedding = nn.Linear(max_atoms, hidden_dim)，要求输入是长度 max_atoms 的连续向量（典型就是 one-hot 或 soft-one-hot）。
+#smooth=False -> self.node_embedding = nn.Embedding(max_atoms, hidden_dim)，要求输入是整数索引（如原子序数）。
+#你当前传入的是原子序数（整数索引），因此应保持 smooth=False。只有当你预先把原子类型编码成 one-hot/soft-one-hot 时才需要设为 True。
+pred_atom_types: false                      # 是否预测原子类型
+                                              #   true: 同时扩散原子类型、晶格和坐标（使用 D3PM）
+                                              #   false: 只扩散晶格和坐标，原子类型固定（类似 DiffCSP）
+
+
+# ==================== Loss Weights ====================
+cost_atom_types: 1.0                        # 原子类型损失权重
+cost_lattice: 1.0                           # 晶格损失权重
+cost_coords: 1.0                            # 坐标损失权重
+
+use_multiscale_film: false

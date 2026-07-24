@@ -1,0 +1,47 @@
+# Perov-5 Attn-RVQ experiment, matched to the MP-20 k=256 protocol.
+wandb:
+  project: crystal-attvqvae
+  run_name: perov_5_attn_rvq_k256_lr3e-4
+
+dataset_name: perov_5
+use_single_csv: false
+data_path: dataset/perov_5
+train_csv: train.csv
+val_csv: val.csv
+test_csv: test.csv
+property: formation_energy
+
+hidden_dim: 512
+num_layers: 6
+codebook_size: 256
+num_quantizers: 1
+num_quantizers_global: 2
+num_quantizers_local: 3
+vq_type: residual_attn
+commitment_weight: 0.5
+aggregator_dropout: 0.2
+aggregator_attn_dropout: 0.2
+aggregator_use_positional: true
+aggregator_positional_scale: 1.0
+residual_use_outer_aggregator: false
+residual_attn_use_outer_aggregator: false
+
+num_space_groups: 230
+max_cn: 20
+num_elements: 104
+loss_weights:
+  recon_global: 1.0
+  recon_local: 1.0
+  space_group: 1.0
+  cn: 1.0
+  commitment: 0.5
+
+num_epochs: 100
+batch_size: 512
+learning_rate: 3.0e-4
+weight_decay: 1.0e-4
+min_lr: 1.0e-5
+grad_clip: 1.0
+workers: 0
+random_seed: 42
+save_every: 10

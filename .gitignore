@@ -1,0 +1,7 @@
+# Large/generated project artifacts kept outside source control.
+/dataset/
+/docs/
+
+# Python bytecode and interpreter caches.
+__pycache__/
+*.py[cod]
