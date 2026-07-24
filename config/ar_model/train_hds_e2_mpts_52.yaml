@@ -1,0 +1,60 @@
+# MPTS-52 E2 main HDS. The longer 52-site sequences require block size 512.
+# Run once with --prepare_hds_cache, then rerun the same config for training.
+dataset_dir: experiments/mpts_52/k256_lr3e-4_hds5x4_unconditional/data/direct_code_hds
+out_dir: experiments/mpts_52/k256_lr3e-4_hds_e2_cached/checkpoints/hds_model
+
+train_file: train_tokens.pkl.gz
+val_file: val_tokens.pkl.gz
+test_file: test_tokens.pkl.gz
+max_seq_len: 512
+batch_size: 64
+num_epochs: 1000
+learning_rate: 3.0e-4
+weight_decay: 1.0e-7
+betas: [0.9, 0.95]
+grad_clip: 1.0
+num_workers: 0
+seed: 42
+
+dropout: 0.2
+n_layer: 4
+n_head: 4
+n_embd: 256
+codebook_size: 256
+codebooksize_global: 256
+codebooksize_local: 256
+num_quantizers_global: 2
+num_quantizers_local: 3
+max_sites: 128
+max_formula_count: 128
+
+include_space_group: false
+include_crystal_system: false
+include_coord: false
+property_names: []
+max_property_bins: 128
+property_scheme: generic
+
+vq_checkpoint_provenance: experiments/mpts_52/k256_lr3e-4_attn_rvq_b64_restart/checkpoints/best_model.pth
+vq_config_provenance: config/attn_rvq/train_cryvqvae_mpts_52_k256_lr3e-4.yaml
+attn_rvq_attention_output_mode: alpha_weighted_residual_attn
+attn_rvq_index_reconstructible_from_hds: false
+
+objective: causal
+stage_marked: true
+canonicalize_hds: true
+compile_strict_hds: true
+use_hds_cache: true
+e2_auxiliary: true
+stage_specific_embeddings: false
+stage_specific_heads: false
+num_candidates: 5
+lambda_ar: 1.0
+lambda_global: 0.5
+lambda_local: 0.5
+self_condition_warmup_fraction: 0.10
+predicted_global_fraction: 0.30
+
+early_stop_patience: 200
+early_stop_min_delta: 0.001
+save_last: true
