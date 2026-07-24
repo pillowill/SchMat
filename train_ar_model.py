@@ -19,11 +19,20 @@ from typing import List, Dict, Any, Iterable, Optional, Sequence, Tuple
 import re
 
 import torch
+from torch.nn import functional as F
 from torch.utils.data import Dataset, DataLoader
 from torch.nn.utils import clip_grad_norm_
 
 import yaml
 from tqdm import tqdm
+
+from scripts.tokenizer import (
+    HDSCompiler,
+    bin_formation_energy_10,
+    hds_stage_names,
+    parse_hds_code_token,
+    sanitize_token_name,
+)
 
 
 def load_pickle(path: str) -> List[Dict[str, Any]]:
@@ -33,12 +42,32 @@ def load_pickle(path: str) -> List[Dict[str, Any]]:
     return data
 
 
-RVQ_STAGE_NAMES: Tuple[str, ...] = (
-    "GLOBAL_Q0", "GLOBAL_Q1", "LOCAL_Q0", "LOCAL_Q1", "LOCAL_Q2",
-)
+def load_property_values(path: Path, id_column: str, value_column: str) -> Dict[str, float]:
+    """Load only the ID/property columns needed by the conditional cache branch."""
+    import pandas as pd
+
+    if not path.is_file():
+        raise FileNotFoundError(f"Property CSV not found: {path}")
+    frame = pd.read_csv(path, usecols=[id_column, value_column])
+    values: Dict[str, float] = {}
+    for row_index, row in frame.iterrows():
+        sample_id = str(row[id_column])
+        if sample_id in values:
+            raise ValueError(f"Duplicate property id={sample_id} in {path}")
+        value = row[value_column]
+        if pd.isna(value):
+            raise ValueError(f"Missing property value for id={sample_id} at row={row_index} in {path}")
+        values[sample_id] = float(value)
+    return values
 
 
-def _stage_name(token: str) -> Optional[str]:
+DEFAULT_RVQ_STAGE_NAMES: Tuple[str, ...] = hds_stage_names(2, 3)
+
+
+def _stage_name(
+    token: str,
+    stage_names: Sequence[str] = DEFAULT_RVQ_STAGE_NAMES,
+) -> Optional[str]:
     """Return the RVQ stage encoded by a code or explicit stage marker."""
     marker = re.fullmatch(r"<STAGE_(GLOBAL|LOCAL)_Q(\d+)>", token)
     code = re.fullmatch(r"<(GLOBAL|LOCAL)_CODE_Q(\d+)_\d+>", token)
@@ -46,7 +75,7 @@ def _stage_name(token: str) -> Optional[str]:
     if not match:
         return None
     name = f"{match.group(1)}_Q{match.group(2)}"
-    return name if name in RVQ_STAGE_NAMES else None
+    return name if name in stage_names else None
 
 
 def canonicalize_hds_tokens(tokens: Sequence[str]) -> List[str]:
@@ -92,21 +121,27 @@ def canonicalize_hds_tokens(tokens: Sequence[str]) -> List[str]:
     return out
 
 
-def stage_mark_hds_tokens(tokens: Sequence[str]) -> List[str]:
+def stage_mark_hds_tokens(
+    tokens: Sequence[str],
+    stage_names: Sequence[str] = DEFAULT_RVQ_STAGE_NAMES,
+) -> List[str]:
     """Insert an explicit marker directly before each RVQ code token."""
     out: List[str] = []
     for token in tokens:
-        stage = _stage_name(token)
+        stage = _stage_name(token, stage_names)
         if stage and not token.startswith("<STAGE_"):
             out.append(f"<STAGE_{stage}>")
         out.append(token)
     return out
 
 
-def build_stage_ids(tokens: Iterable[str]) -> List[int]:
-    """Map syntax to 0 and the five RVQ stages to 1..5."""
-    stage_to_id = {name: index for index, name in enumerate(RVQ_STAGE_NAMES, start=1)}
-    return [stage_to_id.get(_stage_name(token), 0) for token in tokens]
+def build_stage_ids(
+    tokens: Iterable[str],
+    stage_names: Sequence[str] = DEFAULT_RVQ_STAGE_NAMES,
+) -> List[int]:
+    """Map syntax to 0 and configured RVQ stages to consecutive IDs."""
+    stage_to_id = {name: index for index, name in enumerate(stage_names, start=1)}
+    return [stage_to_id.get(_stage_name(token, stage_names), 0) for token in tokens]
 
 
 class CrystalTokenDataset(Dataset):
@@ -122,6 +157,7 @@ class CrystalTokenDataset(Dataset):
         canonicalize: bool = False,
         mask_probability: float = 0.15,
         protected_token_ids: Optional[Sequence[int]] = None,
+        stage_names: Sequence[str] = DEFAULT_RVQ_STAGE_NAMES,
     ):
         if objective not in {"causal", "masked"}:
             raise ValueError(f"Unsupported HDS objective: {objective}")
@@ -135,6 +171,7 @@ class CrystalTokenDataset(Dataset):
         self.pad_id = tokenizer.vocab.token_to_id["<PAD>"]
         self.mask_id = tokenizer.vocab.token_to_id.get("<MASK>")
         self.protected_token_ids = set(protected_token_ids or []) | {self.pad_id}
+        self.stage_names = tuple(stage_names)
         if objective == "masked" and self.mask_id is None:
             raise ValueError("Masked-HDS requires <MASK> in the tokenizer vocabulary")
         self._indices = [i for i, sample in enumerate(samples) if len(sample.get("tokens", [])) >= 2]
@@ -146,11 +183,11 @@ class CrystalTokenDataset(Dataset):
         tokens = list(sample["tokens"])
         if self.canonicalize:
             tokens = canonicalize_hds_tokens(tokens)
-        return stage_mark_hds_tokens(tokens) if self.stage_marked else tokens
+        return stage_mark_hds_tokens(tokens, self.stage_names) if self.stage_marked else tokens
 
     def __getitem__(self, idx: int):
         tokens = self._prepare_tokens(self.samples[self._indices[idx]])
-        stages = build_stage_ids(tokens)
+        stages = build_stage_ids(tokens, self.stage_names)
         pad_to = self.max_seq_len + 1 if self.objective == "causal" else self.max_seq_len
         ids = torch.tensor(self.tokenizer.encode(tokens, pad_to=pad_to), dtype=torch.long)
         stage_ids = torch.tensor((stages + [0] * pad_to)[:pad_to], dtype=torch.long)
@@ -173,7 +210,7 @@ class CrystalTokenDataset(Dataset):
         return input_ids, target_ids, stage_ids, stage_ids, loss_mask
 
 
-CACHE_FORMAT_VERSION = 1
+CACHE_FORMAT_VERSION = 2
 
 
 def _strip_trailing_pad_tokens(tokens: Sequence[str]) -> List[str]:
@@ -206,10 +243,39 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _file_stat_signature(path: Path) -> Dict[str, Any]:
+    """Content signature for property-label sources used by prepared caches."""
+    stat = path.stat()
+    return {"path": str(path), "size": int(stat.st_size), "sha256": _file_sha256(path)}
+
+
+def _artifact_signature(path_value: Optional[str], project_root: Path) -> Optional[Dict[str, Any]]:
+    """Fingerprint a configured Attn-RVQ artifact without changing its stored path.
+
+    Config paths are usually relative to the project root. A content digest makes
+    cache/checkpoint provenance robust against a different file reusing the same
+    filename. Configured artifacts must exist so a misspelled path cannot be
+    frozen into an otherwise valid cache/checkpoint.
+    """
+    if not path_value:
+        return None
+    configured = Path(path_value)
+    resolved = configured if configured.is_absolute() else project_root / configured
+    if not resolved.is_file():
+        raise FileNotFoundError(f"Configured Attn-RVQ provenance artifact does not exist: {resolved}")
+    return {
+        "available": True,
+        "size": int(resolved.stat().st_size),
+        "sha256": _file_sha256(resolved),
+    }
+
+
 def default_hds_cache_dir(dataset_dir: Path, vocab_cfg, args) -> Path:
     """Place derived tensors beside, never inside, the immutable direct HDS."""
     name = (
+        f"v{CACHE_FORMAT_VERSION}_strict{int(args.compile_strict_hds)}_"
         f"canonical{int(args.canonicalize_hds)}_stage{int(args.stage_marked)}_"
+        f"property-{args.property_scheme}_"
         f"g{vocab_cfg.num_quantizers_global}_l{vocab_cfg.num_quantizers_local}_"
         f"k{vocab_cfg.codebooksize_global}_{vocab_cfg.codebooksize_local}_"
         f"max{args.max_seq_len}"
@@ -222,6 +288,7 @@ def _cache_manifest(
     source_paths: Dict[str, Path],
     vocab_cfg,
     args,
+    property_source_paths: Optional[Dict[str, Path]] = None,
 ) -> Dict[str, Any]:
     return {
         "format_version": CACHE_FORMAT_VERSION,
@@ -230,12 +297,22 @@ def _cache_manifest(
             split: {"path": str(path), "sha256": _file_sha256(path)}
             for split, path in source_paths.items()
         },
+        "property_source_files": {
+            split: _file_stat_signature(path)
+            for split, path in (property_source_paths or {}).items()
+        },
         "vocab_config": vocab_cfg.__dict__,
+        "attn_rvq_provenance": getattr(args, "attn_rvq_provenance", {}),
         "transform": {
+            "compile_strict_hds": bool(args.compile_strict_hds),
             "canonicalize_hds": bool(args.canonicalize_hds),
             "stage_marked": bool(args.stage_marked),
-            "stage_marker_schema": list(RVQ_STAGE_NAMES),
+            "stage_marker_schema": list(hds_stage_names(
+                vocab_cfg.num_quantizers_global,
+                vocab_cfg.num_quantizers_local,
+            )),
             "max_seq_len": int(args.max_seq_len),
+            "property_scheme": str(args.property_scheme),
         },
     }
 
@@ -247,34 +324,98 @@ def build_hds_tensor_cache(
     tokenizer,
     vocab_cfg,
     args,
+    split_property_values: Optional[Dict[str, Dict[str, float]]] = None,
+    property_source_paths: Optional[Dict[str, Path]] = None,
 ) -> None:
     """Materialize canonical/stage-marked HDS tensors once for future training.
 
-    The cache stores only full token/stage sequences.  Causal shifts and any
-    future masked corruption remain cheap runtime operations, so one cache can
-    serve both objectives with the same vocabulary configuration.
+    Cache v2 optionally recompiles legacy direct HDS from site atoms and code
+    order.  It stores full sequences plus code positions/targets so E2 can add
+    auxiliary classification without reparsing tokens every epoch.
     """
+    if args.compile_strict_hds and (not args.canonicalize_hds or not args.stage_marked):
+        raise ValueError("--compile_strict_hds requires --canonicalize_hds and --stage_marked")
     cache_dir.mkdir(parents=True, exist_ok=True)
     sequence_size = int(args.max_seq_len) + 1
     pad_id = tokenizer.vocab.token_to_id["<PAD>"]
     unk_id = tokenizer.vocab.token_to_id["<UNK>"]
+    compiler = HDSCompiler(vocab_cfg)
+    stage_names = hds_stage_names(
+        vocab_cfg.num_quantizers_global,
+        vocab_cfg.num_quantizers_local,
+    )
 
     for split, samples in split_samples.items():
         # int32 is supported by the server's PyTorch serialization.  uint16
         # would be smaller but is not portable across the installed runtime.
         token_ids = torch.full((len(samples), sequence_size), pad_id, dtype=torch.int32)
         stage_ids = torch.zeros((len(samples), sequence_size), dtype=torch.uint8)
+        code_position_mask = torch.zeros((len(samples), sequence_size), dtype=torch.bool)
+        code_kinds = torch.zeros((len(samples), sequence_size), dtype=torch.uint8)
+        code_quantizers = torch.full((len(samples), sequence_size), -1, dtype=torch.int16)
+        code_targets = torch.full((len(samples), sequence_size), -1, dtype=torch.int32)
         lengths = torch.zeros(len(samples), dtype=torch.int32)
         sample_ids: List[str] = []
+        composition_counts: List[List[Tuple[str, int]]] = []
+        atom_symbols: List[List[str]] = []
+        canonical_permutations: List[List[int]] = []
+        inverse_permutations: List[List[int]] = []
         too_long: List[Tuple[str, int]] = []
 
         for row, sample in enumerate(samples):
             sample_id = str(sample.get("id", row))
-            tokens = prepare_hds_cache_tokens(
-                sample.get("tokens", []),
-                canonicalize=bool(args.canonicalize_hds),
-                stage_marked=bool(args.stage_marked),
-            )
+            if args.compile_strict_hds:
+                compiled = compiler.compile_legacy_record(sample)
+                if args.property_scheme == "formation_energy_10":
+                    property_values = (split_property_values or {}).get(split, {})
+                    if sample_id not in property_values:
+                        raise ValueError(f"id={sample_id}: no formation-energy value in the {split} property CSV")
+                    if len(vocab_cfg.property_names) != 1:
+                        raise ValueError("formation_energy_10 requires exactly one configured property name")
+                    property_bin = bin_formation_energy_10(property_values[sample_id])
+                    property_tokens = [
+                        "<PROPERTY>",
+                        f"<PROPERTY_NAME_{sanitize_token_name(vocab_cfg.property_names[0])}>",
+                        f"<PROPERTY_BIN_{property_bin}>",
+                        "</PROPERTY>",
+                    ]
+                    compiled = compiler.compile_from_codes(
+                        global_codes=compiled.global_codes,
+                        atom_symbols=compiled.atom_symbols,
+                        local_codes=compiled.local_codes,
+                        property_tokens=property_tokens,
+                    )
+                tokens = compiled.tokens
+                record_stage_ids = compiled.stage_ids
+                record_code_mask = compiled.code_position_mask
+                record_code_kinds = compiled.code_kinds
+                record_code_quantizers = compiled.code_quantizers
+                record_code_targets = compiled.code_targets
+                record_composition = compiled.composition_counts
+                record_atoms = compiled.atom_symbols
+                record_permutation = compiled.canonical_atom_permutation
+                record_inverse = compiled.inverse_canonical_atom_permutation
+            else:
+                tokens = prepare_hds_cache_tokens(
+                    sample.get("tokens", []),
+                    canonicalize=bool(args.canonicalize_hds),
+                    stage_marked=bool(args.stage_marked),
+                )
+                record_stage_ids = build_stage_ids(tokens, stage_names)
+                record_code_mask = []
+                record_code_kinds = []
+                record_code_quantizers = []
+                record_code_targets = []
+                for token in tokens:
+                    parsed = parse_hds_code_token(token)
+                    record_code_mask.append(parsed is not None)
+                    record_code_kinds.append(1 if parsed and parsed[0] == "global" else 2 if parsed else 0)
+                    record_code_quantizers.append(parsed[1] if parsed and parsed[1] is not None else -1)
+                    record_code_targets.append(parsed[2] if parsed else -1)
+                record_composition = []
+                record_atoms = []
+                record_permutation = []
+                record_inverse = []
             encoded = tokenizer.encode(tokens)
             if len(tokens) != len(encoded):
                 raise RuntimeError(f"Tokenizer length mismatch for id={sample_id}")
@@ -288,9 +429,17 @@ def build_hds_tensor_cache(
             length = len(encoded)
             if length:
                 token_ids[row, :length] = torch.tensor(encoded, dtype=torch.int32)
-                stage_ids[row, :length] = torch.tensor(build_stage_ids(tokens), dtype=torch.uint8)
+                stage_ids[row, :length] = torch.tensor(record_stage_ids, dtype=torch.uint8)
+                code_position_mask[row, :length] = torch.tensor(record_code_mask, dtype=torch.bool)
+                code_kinds[row, :length] = torch.tensor(record_code_kinds, dtype=torch.uint8)
+                code_quantizers[row, :length] = torch.tensor(record_code_quantizers, dtype=torch.int16)
+                code_targets[row, :length] = torch.tensor(record_code_targets, dtype=torch.int32)
             lengths[row] = length
             sample_ids.append(sample_id)
+            composition_counts.append([(str(symbol), int(count)) for symbol, count in record_composition])
+            atom_symbols.append([str(symbol) for symbol in record_atoms])
+            canonical_permutations.append([int(index) for index in record_permutation])
+            inverse_permutations.append([int(index) for index in record_inverse])
 
         if too_long:
             preview = ", ".join(f"{sample_id}:{length}" for sample_id, length in too_long[:10])
@@ -306,8 +455,16 @@ def build_hds_tensor_cache(
             "split": split,
             "token_ids": token_ids,
             "stage_ids": stage_ids,
+            "code_position_mask": code_position_mask,
+            "code_kinds": code_kinds,
+            "code_quantizers": code_quantizers,
+            "code_targets": code_targets,
             "lengths": lengths,
             "sample_ids": sample_ids,
+            "composition_counts": composition_counts,
+            "atom_symbols": atom_symbols,
+            "canonical_atom_permutations": canonical_permutations,
+            "inverse_canonical_atom_permutations": inverse_permutations,
         }
         output_path = cache_dir / f"{split}.pt"
         temporary_path = output_path.with_suffix(".pt.tmp")
@@ -318,7 +475,17 @@ def build_hds_tensor_cache(
     manifest_path = cache_dir / "manifest.json"
     temporary_manifest = manifest_path.with_suffix(".json.tmp")
     temporary_manifest.write_text(
-        json.dumps(_cache_manifest(cache_dir, source_paths, vocab_cfg, args), indent=2, sort_keys=True),
+        json.dumps(
+            _cache_manifest(
+                cache_dir,
+                source_paths,
+                vocab_cfg,
+                args,
+                property_source_paths=property_source_paths,
+            ),
+            indent=2,
+            sort_keys=True,
+        ),
         encoding="utf-8",
     )
     temporary_manifest.replace(manifest_path)
@@ -330,24 +497,36 @@ def validate_hds_tensor_cache(
     vocab_cfg,
     args,
     source_paths: Optional[Dict[str, Path]] = None,
+    property_source_paths: Optional[Dict[str, Path]] = None,
 ) -> Dict[str, Any]:
     """Reject stale tensors instead of silently training with a mismatched vocab."""
     manifest_path = cache_dir / "manifest.json"
     if not manifest_path.is_file():
-        raise FileNotFoundError(f"HDS cache manifest not found: {manifest_path}")
+        config_hint = f" --config {args.config}" if getattr(args, "config", None) else ""
+        raise FileNotFoundError(
+            f"HDS cache manifest not found: {manifest_path}. Prepare it first with: "
+            f"python train_ar_model.py{config_hint} --prepare_hds_cache"
+        )
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     if manifest.get("format_version") != CACHE_FORMAT_VERSION:
         raise ValueError("Unsupported HDS cache format version")
     expected_transform = {
+        "compile_strict_hds": bool(args.compile_strict_hds),
         "canonicalize_hds": bool(args.canonicalize_hds),
         "stage_marked": bool(args.stage_marked),
-        "stage_marker_schema": list(RVQ_STAGE_NAMES),
+        "stage_marker_schema": list(hds_stage_names(
+            vocab_cfg.num_quantizers_global,
+            vocab_cfg.num_quantizers_local,
+        )),
         "max_seq_len": int(args.max_seq_len),
+        "property_scheme": str(args.property_scheme),
     }
     if manifest.get("transform") != expected_transform:
         raise ValueError("HDS cache transform does not match the requested training configuration")
     if manifest.get("vocab_config") != vocab_cfg.__dict__:
         raise ValueError("HDS cache vocabulary does not match the requested training configuration")
+    if manifest.get("attn_rvq_provenance", {}) != getattr(args, "attn_rvq_provenance", {}):
+        raise ValueError("HDS cache Attn-RVQ provenance does not match the requested training configuration")
     if source_paths:
         for split, path in source_paths.items():
             cached_source = manifest.get("source_files", {}).get(split)
@@ -355,6 +534,17 @@ def validate_hds_tensor_cache(
                 raise ValueError(f"HDS cache has no source signature for split={split}")
             if cached_source.get("sha256") != _file_sha256(path):
                 raise ValueError(f"HDS cache is stale for split={split}; rebuild it before training")
+    cached_property_sources = manifest.get("property_source_files", {})
+    for split, path in (property_source_paths or {}).items():
+        cached_source = cached_property_sources.get(split)
+        if cached_source is None:
+            raise ValueError(f"HDS cache has no property source signature for split={split}")
+        current_signature = _file_stat_signature(path)
+        if (
+            cached_source.get("size") != current_signature["size"]
+            or cached_source.get("sha256") != current_signature["sha256"]
+        ):
+            raise ValueError(f"HDS cache property source is stale for split={split}")
     return manifest
 
 
@@ -373,6 +563,7 @@ class CachedCrystalTokenDataset(Dataset):
         objective: str = "causal",
         mask_probability: float = 0.15,
         protected_token_ids: Optional[Sequence[int]] = None,
+        return_e2_metadata: bool = False,
     ):
         if objective not in {"causal", "masked"}:
             raise ValueError(f"Unsupported HDS objective: {objective}")
@@ -381,6 +572,10 @@ class CachedCrystalTokenDataset(Dataset):
             raise ValueError(f"Unsupported cache payload: {cache_path}")
         self.token_ids = payload["token_ids"]
         self.stage_ids = payload["stage_ids"]
+        self.code_position_mask = payload.get("code_position_mask")
+        self.code_kinds = payload.get("code_kinds")
+        self.code_quantizers = payload.get("code_quantizers")
+        self.code_targets = payload.get("code_targets")
         self.lengths = payload["lengths"]
         self.max_seq_len = max_seq_len
         self.objective = objective
@@ -388,6 +583,17 @@ class CachedCrystalTokenDataset(Dataset):
         self.pad_id = tokenizer.vocab.token_to_id["<PAD>"]
         self.mask_id = tokenizer.vocab.token_to_id.get("<MASK>")
         self.protected_token_ids = set(protected_token_ids or []) | {self.pad_id}
+        self.return_e2_metadata = bool(return_e2_metadata)
+        if self.return_e2_metadata and any(
+            value is None
+            for value in (
+                self.code_position_mask,
+                self.code_kinds,
+                self.code_quantizers,
+                self.code_targets,
+            )
+        ):
+            raise ValueError(f"E2 metadata is missing from cache payload: {cache_path}")
         if objective == "masked" and self.mask_id is None:
             raise ValueError("Masked-HDS requires <MASK> in the tokenizer vocabulary")
         if self.token_ids.shape[1] != max_seq_len + 1:
@@ -400,6 +606,25 @@ class CachedCrystalTokenDataset(Dataset):
         ids = self.token_ids[idx].to(dtype=torch.long)
         stages = self.stage_ids[idx].to(dtype=torch.long)
         if self.objective == "causal":
+            if self.return_e2_metadata:
+                code_mask = self.code_position_mask[idx].bool()
+                code_kinds = self.code_kinds[idx].long()
+                code_quantizers = self.code_quantizers[idx].long()
+                code_targets = self.code_targets[idx].long()
+                return {
+                    "input_ids": ids[:-1],
+                    "target_ids": ids[1:],
+                    "input_stage_ids": stages[:-1],
+                    "target_stage_ids": stages[1:],
+                    "loss_mask": torch.ones_like(ids[:-1], dtype=torch.bool),
+                    "input_code_mask": code_mask[:-1],
+                    "target_code_mask": code_mask[1:],
+                    "input_code_kinds": code_kinds[:-1],
+                    "target_code_kinds": code_kinds[1:],
+                    "input_code_quantizers": code_quantizers[:-1],
+                    "target_code_quantizers": code_quantizers[1:],
+                    "target_code_indices": code_targets[1:],
+                }
             return ids[:-1], ids[1:], stages[:-1], stages[1:], torch.ones_like(ids[:-1], dtype=torch.bool)
 
         ids = ids[:self.max_seq_len]
@@ -585,6 +810,12 @@ def parse_args():
         help="Maximum site index / NUM_SITES token reserved in vocabulary.",
     )
     parser.add_argument(
+        "--max_formula_count",
+        type=int,
+        default=None,
+        help="Maximum per-element COUNT token. Defaults to legacy-compatible 100.",
+    )
+    parser.add_argument(
         "--include_space_group",
         action="store_true",
         help="Reserve legacy <SPACE_GROUP_*> tokens. Keep off for simplified DSS-seq.",
@@ -681,6 +912,51 @@ def parse_args():
         action="store_true",
         help="Opt in to loading prepared tensors for training. Disabled by default.",
     )
+    parser.add_argument(
+        "--compile_strict_hds",
+        action="store_true",
+        help="Recompile legacy direct HDS into canonical Q-tagged cache-v2 records using site atoms as truth.",
+    )
+    parser.add_argument(
+        "--e2_auxiliary",
+        action="store_true",
+        help="Enable independent global/local code auxiliary heads and E2 curriculum training.",
+    )
+    parser.add_argument("--lambda_ar", type=float, default=1.0, help="Weight of full-sequence AR loss.")
+    parser.add_argument("--lambda_global", type=float, default=0.5, help="Weight of global code auxiliary loss.")
+    parser.add_argument("--lambda_local", type=float, default=0.5, help="Weight of local code auxiliary loss.")
+    parser.add_argument(
+        "--self_condition_warmup_fraction",
+        type=float,
+        default=0.10,
+        help="Fraction of total optimizer steps that use true-global teacher forcing only.",
+    )
+    parser.add_argument(
+        "--predicted_global_fraction",
+        type=float,
+        default=0.30,
+        help="Maximum fraction of global input codes replaced by detached greedy predictions.",
+    )
+    parser.add_argument(
+        "--dry_run_batches",
+        type=int,
+        default=0,
+        help="If >0, stop each train/validation epoch after this many batches for smoke testing.",
+    )
+    parser.add_argument(
+        "--property_scheme",
+        choices=["generic", "formation_energy_10"],
+        default="generic",
+        help="Keep the strict 10-bin formation-energy experiment isolated from unconditional/main caches.",
+    )
+    parser.add_argument(
+        "--property_csv_dir",
+        type=str,
+        default=None,
+        help="Directory containing train.csv/val.csv/test.csv for the independent property cache branch.",
+    )
+    parser.add_argument("--property_id_column", type=str, default="material_id")
+    parser.add_argument("--property_value_column", type=str, default="formation_energy_per_atom")
     args = parser.parse_args()
 
     # YAML config support (optional)
@@ -721,6 +997,7 @@ def parse_args():
             "num_quantizers_global": None,
             "num_quantizers_local": None,
             "max_sites": 128,
+            "max_formula_count": None,
             "include_space_group": False,
             "include_crystal_system": False,
             "include_coord": False,
@@ -738,6 +1015,18 @@ def parse_args():
             "prepare_hds_cache": False,
             "hds_cache_dir": None,
             "use_hds_cache": False,
+            "compile_strict_hds": False,
+            "e2_auxiliary": False,
+            "lambda_ar": 1.0,
+            "lambda_global": 0.5,
+            "lambda_local": 0.5,
+            "self_condition_warmup_fraction": 0.10,
+            "predicted_global_fraction": 0.30,
+            "dry_run_batches": 0,
+            "property_scheme": "generic",
+            "property_csv_dir": None,
+            "property_id_column": "material_id",
+            "property_value_column": "formation_energy_per_atom",
         }
 
         # CLI override for list-like property names
@@ -775,6 +1064,32 @@ def parse_args():
     if args.property_names is not None and not isinstance(args.property_names, list):
         args.property_names = [p.strip() for p in str(args.property_names).split(",") if p.strip()]
 
+    if args.e2_auxiliary:
+        if args.objective != "causal":
+            raise ValueError("E2 auxiliary training requires --objective causal")
+        if not args.use_hds_cache:
+            raise ValueError("E2 auxiliary training requires --use_hds_cache")
+        if not args.compile_strict_hds:
+            raise ValueError("E2 auxiliary training requires cache v2 built with --compile_strict_hds")
+        if not args.canonicalize_hds or not args.stage_marked:
+            raise ValueError("E2 auxiliary training requires --canonicalize_hds and --stage_marked")
+        if args.stage_specific_heads:
+            raise ValueError("E2 uses independent auxiliary heads; disable legacy --stage_specific_heads")
+        if args.stage_specific_embeddings:
+            raise ValueError("E2 main setting keeps legacy stage-specific embeddings disabled")
+    if not 0.0 <= args.self_condition_warmup_fraction <= 1.0:
+        raise ValueError("self_condition_warmup_fraction must be in [0, 1]")
+    if not 0.0 <= args.predicted_global_fraction <= 1.0:
+        raise ValueError("predicted_global_fraction must be in [0, 1]")
+    if min(args.lambda_ar, args.lambda_global, args.lambda_local) < 0:
+        raise ValueError("E2 loss weights must be non-negative")
+    if args.property_scheme == "formation_energy_10" and args.max_property_bins is not None:
+        if int(args.max_property_bins) <= 10:
+            raise ValueError("formation_energy_10 uses one-based bins 1..10; max_property_bins must be >=11")
+    if args.property_scheme == "formation_energy_10":
+        if not args.property_csv_dir:
+            raise ValueError("formation_energy_10 requires --property_csv_dir")
+
     return args
 
 
@@ -788,6 +1103,302 @@ def set_seed(seed: int):
     if torch.cuda.is_available():
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
+
+
+def e2_predicted_global_fraction(
+    optimizer_step: int,
+    total_steps: int,
+    warmup_fraction: float,
+    maximum_fraction: float,
+) -> float:
+    """Linear true-global -> predicted-global curriculum schedule."""
+    if total_steps <= 0 or maximum_fraction <= 0:
+        return 0.0
+    warmup_steps = int(round(total_steps * warmup_fraction))
+    if optimizer_step < warmup_steps:
+        return 0.0
+    remaining = max(total_steps - warmup_steps, 1)
+    progress = min(max((optimizer_step - warmup_steps) / remaining, 0.0), 1.0)
+    return float(maximum_fraction) * float(progress)
+
+
+def _masked_ce_sum(logits: torch.Tensor, targets: torch.Tensor, mask: torch.Tensor):
+    flat_loss = F.cross_entropy(
+        logits.reshape(-1, logits.size(-1)),
+        targets.reshape(-1),
+        reduction="none",
+    ).view_as(targets)
+    mask = mask.bool()
+    return (flat_loss * mask).sum(), int(mask.sum().item())
+
+
+def _restricted_code_predictions(
+    logits: torch.Tensor,
+    code_kinds: torch.Tensor,
+    code_quantizers: torch.Tensor,
+    global_token_ids: torch.Tensor,
+    local_token_ids: torch.Tensor,
+) -> torch.Tensor:
+    """Return codebook indices after restricting LM logits to the active stage."""
+    predictions = torch.full_like(code_quantizers, -1)
+    for q in range(global_token_ids.size(0)):
+        positions = (code_kinds == 1) & (code_quantizers == q)
+        if positions.any():
+            allowed = global_token_ids[q]
+            predictions[positions] = logits[positions][:, allowed].argmax(dim=-1)
+    for q in range(local_token_ids.size(0)):
+        positions = (code_kinds == 2) & (code_quantizers == q)
+        if positions.any():
+            allowed = local_token_ids[q]
+            predictions[positions] = logits[positions][:, allowed].argmax(dim=-1)
+    return predictions
+
+
+def run_e2_batch(
+    model,
+    batch: Dict[str, torch.Tensor],
+    device: torch.device,
+    global_token_ids: torch.Tensor,
+    local_token_ids: torch.Tensor,
+    predicted_fraction: float,
+    lambda_ar: float,
+    lambda_global: float,
+    lambda_local: float,
+    deterministic_replacement: bool = False,
+):
+    """Run E2's two-pass objective and return loss plus analysis counters."""
+    tensors = {key: value.to(device, non_blocking=True) for key, value in batch.items()}
+    input_ids = tensors["input_ids"]
+    target_ids = tensors["target_ids"]
+    input_stage_ids = tensors["input_stage_ids"]
+    target_stage_ids = tensors["target_stage_ids"]
+    loss_mask = tensors["loss_mask"].bool()
+    target_kinds = tensors["target_code_kinds"]
+    target_quantizers = tensors["target_code_quantizers"]
+    target_code_indices = tensors["target_code_indices"]
+
+    first_logits, _, first_hidden = model(
+        input_ids,
+        targets=target_ids,
+        stage_ids=input_stage_ids,
+        head_stage_ids=target_stage_ids,
+        loss_mask=loss_mask,
+        return_hidden=True,
+    )
+    first_aux = model.compute_code_auxiliary(
+        first_hidden,
+        target_kinds,
+        target_quantizers,
+        target_code_indices,
+    )
+
+    conditioned_input = input_ids
+    replacements = 0
+    if predicted_fraction > 0:
+        conditioned_input = input_ids.clone()
+        global_targets = (target_kinds == 1) & (first_aux["predictions"] >= 0)
+        if deterministic_replacement:
+            # Validation must be repeatable.  This inexpensive position hash is
+            # stable across runs and approximates a uniform [0, 1) selector.
+            row = torch.arange(target_ids.size(0), device=device).unsqueeze(1)
+            col = torch.arange(target_ids.size(1), device=device).unsqueeze(0)
+            sampled = ((row * 131 + col * 37 + 17) % 1000) < int(round(predicted_fraction * 1000))
+        else:
+            sampled = torch.rand_like(target_code_indices, dtype=torch.float32) < predicted_fraction
+        selected = global_targets & sampled
+        batch_indices, marker_positions = selected.nonzero(as_tuple=True)
+        code_positions = marker_positions + 1
+        valid = code_positions < conditioned_input.size(1)
+        batch_indices = batch_indices[valid]
+        marker_positions = marker_positions[valid]
+        code_positions = code_positions[valid]
+        if code_positions.numel() > 0:
+            quantizers = target_quantizers[batch_indices, marker_positions]
+            predicted_indices = first_aux["predictions"][batch_indices, marker_positions]
+            predicted_token_ids = global_token_ids[quantizers, predicted_indices]
+            actual_global_slot = tensors["input_code_kinds"][batch_indices, code_positions] == 1
+            if not actual_global_slot.all():
+                raise ValueError("Global self-conditioning metadata is not aligned with input code slots")
+            conditioned_input[batch_indices, code_positions] = predicted_token_ids
+            replacements = int(code_positions.numel())
+
+    if replacements > 0:
+        second_logits, _, second_hidden = model(
+            conditioned_input,
+            targets=target_ids,
+            stage_ids=input_stage_ids,
+            head_stage_ids=target_stage_ids,
+            loss_mask=loss_mask,
+            return_hidden=True,
+        )
+        second_aux = model.compute_code_auxiliary(
+            second_hidden,
+            target_kinds,
+            target_quantizers,
+            target_code_indices,
+        )
+    else:
+        second_logits = first_logits
+        second_aux = first_aux
+
+    valid_targets = loss_mask & (target_ids != model.padding_token_id)
+    local_code_positions = valid_targets & (target_kinds == 2)
+    first_positions = valid_targets & ~local_code_positions
+    first_sum, first_count = _masked_ce_sum(first_logits, target_ids, first_positions)
+    local_sum, local_count = _masked_ce_sum(second_logits, target_ids, local_code_positions)
+    ar_count = first_count + local_count
+    ar_loss = (first_sum + local_sum) / max(ar_count, 1)
+
+    total_loss = (
+        float(lambda_ar) * ar_loss
+        + float(lambda_global) * first_aux["global_loss"]
+        + float(lambda_local) * second_aux["local_loss"]
+    )
+
+    analysis_logits = second_logits
+    ar_predictions = _restricted_code_predictions(
+        analysis_logits,
+        target_kinds,
+        target_quantizers,
+        global_token_ids,
+        local_token_ids,
+    )
+    global_mask = (target_kinds == 1) & (target_code_indices >= 0)
+    local_mask = (target_kinds == 2) & (target_code_indices >= 0)
+    global_ar_correct = int((ar_predictions[global_mask] == target_code_indices[global_mask]).sum().item())
+    local_ar_correct = int((ar_predictions[local_mask] == target_code_indices[local_mask]).sum().item())
+
+    global_exact = 0
+    local_exact = 0
+    for row in range(target_ids.size(0)):
+        row_global = global_mask[row]
+        row_local = local_mask[row]
+        if row_global.any() and torch.equal(ar_predictions[row][row_global], target_code_indices[row][row_global]):
+            global_exact += 1
+        if row_local.any() and torch.equal(ar_predictions[row][row_local], target_code_indices[row][row_local]):
+            local_exact += 1
+
+    return total_loss, {
+        "ar_loss": float(ar_loss.detach().item()),
+        "ar_count": int(ar_count),
+        "global_aux_loss": float(first_aux["global_loss"].detach().item()),
+        "local_aux_loss": float(second_aux["local_loss"].detach().item()),
+        "global_ar_correct": global_ar_correct,
+        "global_ar_count": int(global_mask.sum().item()),
+        "local_ar_correct": local_ar_correct,
+        "local_ar_count": int(local_mask.sum().item()),
+        "global_aux_correct": int(first_aux["global_correct"]),
+        "global_aux_count": int(first_aux["global_count"]),
+        "local_aux_correct": int(second_aux["local_correct"]),
+        "local_aux_count": int(second_aux["local_count"]),
+        "global_exact": global_exact,
+        "local_exact": local_exact,
+        "sample_count": int(target_ids.size(0)),
+        "global_replacements": replacements,
+    }
+
+
+def build_code_token_id_tables(vocab, vocab_cfg, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Map each configured RVQ stage/code index to its vocabulary token ID."""
+    global_ids = [
+        [vocab.token_to_id[f"<GLOBAL_CODE_Q{q}_{code}>"] for code in range(vocab_cfg.codebooksize_global)]
+        for q in range(vocab_cfg.num_quantizers_global)
+    ]
+    local_ids = [
+        [vocab.token_to_id[f"<LOCAL_CODE_Q{q}_{code}>"] for code in range(vocab_cfg.codebooksize_local)]
+        for q in range(vocab_cfg.num_quantizers_local)
+    ]
+    return (
+        torch.tensor(global_ids, dtype=torch.long, device=device),
+        torch.tensor(local_ids, dtype=torch.long, device=device),
+    )
+
+
+def new_e2_metric_totals() -> Dict[str, float]:
+    """Create an additive accumulator for E2 losses and analysis-only metrics."""
+    return {
+        "loss_sum": 0.0,
+        "batches": 0.0,
+        "ar_loss_sum": 0.0,
+        "ar_count": 0.0,
+        "global_aux_loss_sum": 0.0,
+        "global_aux_count": 0.0,
+        "local_aux_loss_sum": 0.0,
+        "local_aux_count": 0.0,
+        "global_ar_correct": 0.0,
+        "global_ar_count": 0.0,
+        "local_ar_correct": 0.0,
+        "local_ar_count": 0.0,
+        "global_aux_correct": 0.0,
+        "local_aux_correct": 0.0,
+        "global_exact": 0.0,
+        "local_exact": 0.0,
+        "sample_count": 0.0,
+        "global_replacements": 0.0,
+    }
+
+
+def update_e2_metric_totals(
+    totals: Dict[str, float],
+    loss: torch.Tensor,
+    stats: Dict[str, Any],
+) -> None:
+    """Accumulate weighted losses so variable site counts do not bias reports."""
+    totals["loss_sum"] += float(loss.detach().item())
+    totals["batches"] += 1
+    totals["ar_loss_sum"] += float(stats["ar_loss"]) * int(stats["ar_count"])
+    totals["ar_count"] += int(stats["ar_count"])
+    totals["global_aux_loss_sum"] += float(stats["global_aux_loss"]) * int(stats["global_aux_count"])
+    totals["global_aux_count"] += int(stats["global_aux_count"])
+    totals["local_aux_loss_sum"] += float(stats["local_aux_loss"]) * int(stats["local_aux_count"])
+    totals["local_aux_count"] += int(stats["local_aux_count"])
+    for key in (
+        "global_ar_correct",
+        "global_ar_count",
+        "local_ar_correct",
+        "local_ar_count",
+        "global_aux_correct",
+        "local_aux_correct",
+        "global_exact",
+        "local_exact",
+        "sample_count",
+        "global_replacements",
+    ):
+        totals[key] += int(stats[key])
+
+
+def finalize_e2_metrics(totals: Dict[str, float]) -> Dict[str, float]:
+    """Return serializable loss/accuracy metrics; they are analysis, not gates."""
+    def ratio(numerator: str, denominator: str) -> float:
+        return float(totals[numerator]) / max(float(totals[denominator]), 1.0)
+
+    return {
+        "loss": ratio("loss_sum", "batches"),
+        "ar_loss": ratio("ar_loss_sum", "ar_count"),
+        "global_aux_loss": ratio("global_aux_loss_sum", "global_aux_count"),
+        "local_aux_loss": ratio("local_aux_loss_sum", "local_aux_count"),
+        "global_ar_accuracy": ratio("global_ar_correct", "global_ar_count"),
+        "local_ar_accuracy": ratio("local_ar_correct", "local_ar_count"),
+        "global_aux_accuracy": ratio("global_aux_correct", "global_aux_count"),
+        "local_aux_accuracy": ratio("local_aux_correct", "local_aux_count"),
+        "global_exact_match": ratio("global_exact", "sample_count"),
+        "local_exact_match": ratio("local_exact", "sample_count"),
+        "global_replacement_rate": ratio("global_replacements", "global_ar_count"),
+        "sample_count": int(totals["sample_count"]),
+        "batch_count": int(totals["batches"]),
+    }
+
+
+def format_e2_metrics(metrics: Dict[str, float]) -> str:
+    """Compact one-line E2 report for experiment logs."""
+    return (
+        f"loss={metrics['loss']:.4f}, ar={metrics['ar_loss']:.4f}, "
+        f"g_aux={metrics['global_aux_loss']:.4f}, l_aux={metrics['local_aux_loss']:.4f}, "
+        f"g_ar_acc={metrics['global_ar_accuracy']:.4f}, l_ar_acc={metrics['local_ar_accuracy']:.4f}, "
+        f"g_aux_acc={metrics['global_aux_accuracy']:.4f}, l_aux_acc={metrics['local_aux_accuracy']:.4f}, "
+        f"g_exact={metrics['global_exact_match']:.4f}, l_exact={metrics['local_exact_match']:.4f}, "
+        f"replace={metrics['global_replacement_rate']:.4f}"
+    )
 
 
 
@@ -848,6 +1459,27 @@ def main():
         with open(Path(args.config), "r", encoding="utf-8") as f:
             cfg = yaml.safe_load(f) or {}
 
+    vq_checkpoint_provenance = cfg.get("vq_checkpoint_provenance")
+    vq_config_provenance = cfg.get("vq_config_provenance")
+    if args.e2_auxiliary and not (vq_checkpoint_provenance and vq_config_provenance):
+        raise ValueError(
+            "E2 training requires vq_checkpoint_provenance and vq_config_provenance "
+            "to bind the run to one Attn-RVQ codebook"
+        )
+    args.attn_rvq_provenance = {}
+    if vq_checkpoint_provenance or vq_config_provenance:
+        args.attn_rvq_provenance = {
+            "vq_checkpoint": vq_checkpoint_provenance,
+            "vq_config": vq_config_provenance,
+            "vq_checkpoint_signature": _artifact_signature(vq_checkpoint_provenance, project_root),
+            "vq_config_signature": _artifact_signature(vq_config_provenance, project_root),
+            "attention_output_mode": cfg.get("attn_rvq_attention_output_mode", "unspecified"),
+            "index_reconstructible_from_hds": cfg.get(
+                "attn_rvq_index_reconstructible_from_hds",
+                None,
+            ),
+        }
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     dataset_dir = Path(args.dataset_dir)
@@ -879,6 +1511,7 @@ def main():
     num_quantizers_global = int(resolve_vocab_value(args, cfg, "num_quantizers_global", cfg.get("num_quantizers", 1)) or 1)
     num_quantizers_local = int(resolve_vocab_value(args, cfg, "num_quantizers_local", cfg.get("num_quantizers", 1)) or 1)
     max_sites = int(resolve_vocab_value(args, cfg, "max_sites", 128))
+    max_formula_count = int(resolve_vocab_value(args, cfg, "max_formula_count", 100))
 
     vocab_cfg = CrystalVocabConfig(
         num_quantizers_global=num_quantizers_global,
@@ -886,6 +1519,7 @@ def main():
         num_quantizers_local=num_quantizers_local,
         codebooksize_local=codebooksize_local,
         max_sites=max_sites,
+        max_formula_count=max_formula_count,
         max_coord=20,
         include_space_group_tokens=bool(args.include_space_group or cfg.get("include_space_group", False)),
         include_crystal_system_tokens=bool(args.include_crystal_system or cfg.get("include_crystal_system", False)),
@@ -915,6 +1549,13 @@ def main():
 
     max_seq_len = args.max_seq_len
     cache_dir = Path(args.hds_cache_dir) if args.hds_cache_dir else default_hds_cache_dir(dataset_dir, vocab_cfg, args)
+    property_source_paths: Dict[str, Path] = {}
+    if args.property_scheme == "formation_energy_10":
+        property_csv_dir = Path(args.property_csv_dir)
+        property_source_paths = {
+            "train": property_csv_dir / "train.csv",
+            "val": property_csv_dir / "val.csv",
+        }
 
     if args.prepare_hds_cache:
         split_samples: Dict[str, List[Dict[str, Any]]] = {
@@ -930,9 +1571,19 @@ def main():
             print(f"Loading test tokens from {test_path}")
             split_samples["test"] = load_pickle(str(test_path))
             source_paths["test"] = test_path
+            if args.property_scheme == "formation_energy_10":
+                property_source_paths["test"] = Path(args.property_csv_dir) / "test.csv"
         else:
             print(f"[Cache] test token file not found; caching train/val only: {test_path}")
 
+        split_property_values = {
+            split: load_property_values(
+                path,
+                id_column=args.property_id_column,
+                value_column=args.property_value_column,
+            )
+            for split, path in property_source_paths.items()
+        }
         build_hds_tensor_cache(
             cache_dir=cache_dir,
             split_samples=split_samples,
@@ -940,6 +1591,8 @@ def main():
             tokenizer=tokenizer,
             vocab_cfg=vocab_cfg,
             args=args,
+            split_property_values=split_property_values,
+            property_source_paths=property_source_paths,
         )
         print("[Cache] preparation complete; normal training remains disabled for this command.")
         return
@@ -961,6 +1614,7 @@ def main():
         canonicalize=args.canonicalize_hds,
         mask_probability=args.masked_probability,
         protected_token_ids=protected_token_ids,
+        stage_names=hds_stage_names(num_quantizers_global, num_quantizers_local),
     )
     if args.use_hds_cache:
         validate_hds_tensor_cache(
@@ -968,6 +1622,7 @@ def main():
             vocab_cfg,
             args,
             source_paths={"train": train_path, "val": val_path},
+            property_source_paths=property_source_paths,
         )
         print(f"[Cache] reading prepared tensors from {cache_dir}")
         train_dataset = CachedCrystalTokenDataset(
@@ -977,6 +1632,7 @@ def main():
             objective=args.objective,
             mask_probability=args.masked_probability,
             protected_token_ids=protected_token_ids,
+            return_e2_metadata=args.e2_auxiliary,
         )
         val_dataset = CachedCrystalTokenDataset(
             cache_dir / "val.pt",
@@ -985,6 +1641,7 @@ def main():
             objective=args.objective,
             mask_probability=args.masked_probability,
             protected_token_ids=protected_token_ids,
+            return_e2_metadata=args.e2_auxiliary,
         )
     else:
         train_dataset = CrystalTokenDataset(train_samples, **dataset_kwargs)
@@ -1017,9 +1674,14 @@ def main():
         dropout=args.dropout,
         bias=True,
         attention_mode="bidirectional" if args.objective == "masked" else "causal",
-        num_rvq_stages=len(RVQ_STAGE_NAMES),
+        num_rvq_stages=len(hds_stage_names(num_quantizers_global, num_quantizers_local)),
         stage_specific_embeddings=args.stage_specific_embeddings,
         stage_specific_heads=args.stage_specific_heads,
+        num_quantizers_global=num_quantizers_global,
+        num_quantizers_local=num_quantizers_local,
+        codebooksize_global=codebooksize_global,
+        codebooksize_local=codebooksize_local,
+        auxiliary_code_heads=args.e2_auxiliary,
     )
     model = GPT(gpt_cfg).to(device)
 
@@ -1029,6 +1691,9 @@ def main():
         learning_rate=args.learning_rate,
         betas=tuple(args.betas),
     )
+    global_token_ids = local_token_ids = None
+    if args.e2_auxiliary:
+        global_token_ids, local_token_ids = build_code_token_id_tables(vocab, vocab_cfg, device)
 
     os.makedirs(args.out_dir, exist_ok=True)
     best_val_loss = float("inf")
@@ -1037,27 +1702,38 @@ def main():
     early_stop_min_delta = float(args.early_stop_min_delta or 0.0)
 
     start_epoch = 1
+    global_step = 0
+    total_training_steps = max(len(train_loader) * int(args.num_epochs), 1)
     if args.resume_checkpoint:
         resume_path = Path(args.resume_checkpoint)
         if not resume_path.is_file():
             raise FileNotFoundError(f"Resume checkpoint not found: {resume_path}")
         checkpoint = torch.load(resume_path, map_location=device)
-        saved_cfg = checkpoint.get("gpt_config", {})
+        saved_cfg = GPTConfig(**checkpoint.get("gpt_config", {})).__dict__
         current_cfg = gpt_cfg.__dict__
         incompatible = {
             key: (saved_cfg.get(key), value)
             for key, value in current_cfg.items()
-            if key in saved_cfg and saved_cfg[key] != value
+            if saved_cfg.get(key) != value
         }
         if incompatible:
             raise ValueError(f"Resume checkpoint architecture differs from requested run: {incompatible}")
+        saved_vocab_cfg = CrystalVocabConfig(**checkpoint.get("vocab_config", {})).__dict__
+        if saved_vocab_cfg != vocab_cfg.__dict__:
+            raise ValueError("Resume checkpoint vocabulary differs from the requested HDS run")
+        if checkpoint.get("attn_rvq_provenance", {}) != args.attn_rvq_provenance:
+            raise ValueError("Resume checkpoint Attn-RVQ provenance differs from the requested HDS run")
         model.load_state_dict(checkpoint["model_state_dict"])
         if "optimizer_state_dict" in checkpoint:
             optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         start_epoch = int(checkpoint.get("epoch", 0)) + 1
         best_val_loss = float(checkpoint.get("best_val_loss", best_val_loss))
         epochs_no_improve = int(checkpoint.get("epochs_no_improve", 0))
-        print(f"Resumed from {resume_path}: next epoch={start_epoch}, best_val_loss={best_val_loss:.4f}")
+        global_step = int(checkpoint.get("global_step", (start_epoch - 1) * len(train_loader)))
+        print(
+            f"Resumed from {resume_path}: next epoch={start_epoch}, "
+            f"global_step={global_step}, best_val_loss={best_val_loss:.4f}"
+        )
 
     print(
         f"Early stopping: patience={early_stop_patience}, "
@@ -1069,41 +1745,31 @@ def main():
         model.train()
         total_loss = 0.0
         num_batches = 0
+        train_e2_totals = new_e2_metric_totals() if args.e2_auxiliary else None
 
         pbar = tqdm(train_loader, desc=f"Train {epoch}/{args.num_epochs}", leave=False)
-        for batch in pbar:
-            input_ids, target_ids, input_stage_ids, target_stage_ids, loss_mask = batch
-            input_ids = input_ids.to(device, non_blocking=True)
-            target_ids = target_ids.to(device, non_blocking=True)
-            input_stage_ids = input_stage_ids.to(device, non_blocking=True)
-            target_stage_ids = target_stage_ids.to(device, non_blocking=True)
-            loss_mask = loss_mask.to(device, non_blocking=True)
-
-            logits, loss = model(
-                input_ids, targets=target_ids, stage_ids=input_stage_ids,
-                head_stage_ids=target_stage_ids, loss_mask=loss_mask,
-            )
-            assert loss is not None
-
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            if args.grad_clip and args.grad_clip > 0:
-                clip_grad_norm_(model.parameters(), args.grad_clip)
-            optimizer.step()
-
-            total_loss += loss.item()
-            num_batches += 1
-            pbar.set_postfix(loss=f"{loss.item():.4f}", avg=f"{(total_loss/max(num_batches,1)):.4f}")
-
-        avg_train_loss = total_loss / max(num_batches, 1)
-
-        # 验证
-        model.eval()
-        val_loss_total = 0.0
-        val_batches = 0
-        with torch.no_grad():
-            vbar = tqdm(val_loader, desc=f"Val   {epoch}/{args.num_epochs}", leave=False)
-            for batch in vbar:
+        for batch_index, batch in enumerate(pbar):
+            if args.e2_auxiliary:
+                assert global_token_ids is not None and local_token_ids is not None
+                predicted_fraction = e2_predicted_global_fraction(
+                    global_step,
+                    total_training_steps,
+                    args.self_condition_warmup_fraction,
+                    args.predicted_global_fraction,
+                )
+                loss, e2_stats = run_e2_batch(
+                    model=model,
+                    batch=batch,
+                    device=device,
+                    global_token_ids=global_token_ids,
+                    local_token_ids=local_token_ids,
+                    predicted_fraction=predicted_fraction,
+                    lambda_ar=args.lambda_ar,
+                    lambda_global=args.lambda_global,
+                    lambda_local=args.lambda_local,
+                )
+                update_e2_metric_totals(train_e2_totals, loss, e2_stats)
+            else:
                 input_ids, target_ids, input_stage_ids, target_stage_ids, loss_mask = batch
                 input_ids = input_ids.to(device, non_blocking=True)
                 target_ids = target_ids.to(device, non_blocking=True)
@@ -1115,17 +1781,87 @@ def main():
                     head_stage_ids=target_stage_ids, loss_mask=loss_mask,
                 )
                 assert loss is not None
+
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            if args.grad_clip and args.grad_clip > 0:
+                clip_grad_norm_(model.parameters(), args.grad_clip)
+            optimizer.step()
+            global_step += 1
+
+            total_loss += loss.item()
+            num_batches += 1
+            postfix = {"loss": f"{loss.item():.4f}", "avg": f"{(total_loss/max(num_batches,1)):.4f}"}
+            if args.e2_auxiliary:
+                postfix["pred_g"] = f"{predicted_fraction:.3f}"
+            pbar.set_postfix(**postfix)
+            if args.dry_run_batches > 0 and batch_index + 1 >= args.dry_run_batches:
+                break
+
+        avg_train_loss = total_loss / max(num_batches, 1)
+        train_metrics = finalize_e2_metrics(train_e2_totals) if args.e2_auxiliary else {"loss": avg_train_loss}
+
+        # 验证
+        model.eval()
+        val_loss_total = 0.0
+        val_batches = 0
+        val_e2_totals = new_e2_metric_totals() if args.e2_auxiliary else None
+        with torch.no_grad():
+            vbar = tqdm(val_loader, desc=f"Val   {epoch}/{args.num_epochs}", leave=False)
+            for batch_index, batch in enumerate(vbar):
+                if args.e2_auxiliary:
+                    assert global_token_ids is not None and local_token_ids is not None
+                    loss, e2_stats = run_e2_batch(
+                        model=model,
+                        batch=batch,
+                        device=device,
+                        global_token_ids=global_token_ids,
+                        local_token_ids=local_token_ids,
+                        predicted_fraction=args.predicted_global_fraction,
+                        lambda_ar=args.lambda_ar,
+                        lambda_global=args.lambda_global,
+                        lambda_local=args.lambda_local,
+                        deterministic_replacement=True,
+                    )
+                    update_e2_metric_totals(val_e2_totals, loss, e2_stats)
+                else:
+                    input_ids, target_ids, input_stage_ids, target_stage_ids, loss_mask = batch
+                    input_ids = input_ids.to(device, non_blocking=True)
+                    target_ids = target_ids.to(device, non_blocking=True)
+                    input_stage_ids = input_stage_ids.to(device, non_blocking=True)
+                    target_stage_ids = target_stage_ids.to(device, non_blocking=True)
+                    loss_mask = loss_mask.to(device, non_blocking=True)
+                    _, loss = model(
+                        input_ids, targets=target_ids, stage_ids=input_stage_ids,
+                        head_stage_ids=target_stage_ids, loss_mask=loss_mask,
+                    )
+                    assert loss is not None
                 val_loss_total += loss.item()
                 val_batches += 1
                 vbar.set_postfix(loss=f"{loss.item():.4f}", avg=f"{(val_loss_total/max(val_batches,1)):.4f}")
+                if args.dry_run_batches > 0 and batch_index + 1 >= args.dry_run_batches:
+                    break
 
         avg_val_loss = val_loss_total / max(val_batches, 1)
+        val_metrics = finalize_e2_metrics(val_e2_totals) if args.e2_auxiliary else {"loss": avg_val_loss}
 
-        print(
-            f"Epoch {epoch}/{args.num_epochs} "
-            f"- train loss: {avg_train_loss:.4f} "
-            f"- val loss: {avg_val_loss:.4f}"
-        )
+        if args.e2_auxiliary:
+            print(f"Epoch {epoch}/{args.num_epochs} - train E2: {format_e2_metrics(train_metrics)}")
+            print(f"Epoch {epoch}/{args.num_epochs} - val E2:   {format_e2_metrics(val_metrics)}")
+        else:
+            print(
+                f"Epoch {epoch}/{args.num_epochs} "
+                f"- train loss: {avg_train_loss:.4f} "
+                f"- val loss: {avg_val_loss:.4f}"
+            )
+
+        # 保存最佳模型：只有超过 min_delta 的改善才算刷新 best。
+        improved = avg_val_loss < (best_val_loss - early_stop_min_delta)
+        if improved:
+            best_val_loss = avg_val_loss
+            epochs_no_improve = 0
+        else:
+            epochs_no_improve += 1
 
         ckpt_payload = {
             "epoch": epoch,
@@ -1143,28 +1879,34 @@ def main():
             "stage_marked": args.stage_marked,
             "canonicalize_hds": args.canonicalize_hds,
             "num_candidates": args.num_candidates,
+            "global_step": global_step,
+            "total_training_steps": total_training_steps,
+            "train_metrics": train_metrics,
+            "val_metrics": val_metrics,
+            "hds_cache_dir": str(cache_dir) if args.use_hds_cache else None,
+            "e2_config": {
+                "enabled": bool(args.e2_auxiliary),
+                "lambda_ar": float(args.lambda_ar),
+                "lambda_global": float(args.lambda_global),
+                "lambda_local": float(args.lambda_local),
+                "self_condition_warmup_fraction": float(args.self_condition_warmup_fraction),
+                "predicted_global_fraction": float(args.predicted_global_fraction),
+                "validation_predicted_global_fraction": float(args.predicted_global_fraction),
+                "validation_replacement": "deterministic_position_hash",
+                "property_scheme": str(args.property_scheme),
+            },
+            "attn_rvq_provenance": args.attn_rvq_provenance,
         }
 
         if args.save_last:
             last_path = Path(args.out_dir) / "last_cry2seq.pt"
             torch.save(ckpt_payload, last_path)
 
-        # 保存最佳模型：只有超过 min_delta 的改善才算刷新 best。
-        improved = avg_val_loss < (best_val_loss - early_stop_min_delta)
         if improved:
-            best_val_loss = avg_val_loss
-            epochs_no_improve = 0
-            ckpt_payload.update(
-                {
-                    "best_val_loss": best_val_loss,
-                    "epochs_no_improve": epochs_no_improve,
-                }
-            )
             save_path = Path(args.out_dir) / "best_cry2seq.pt"
             torch.save(ckpt_payload, save_path)
-            print(f"  ✓ Saved best model to {save_path} (best_val_loss={best_val_loss:.4f})")
+            print(f"  Saved best model to {save_path} (best_val_loss={best_val_loss:.4f})")
         else:
-            epochs_no_improve += 1
             if early_stop_patience > 0:
                 print(
                     f"  Early-stop counter: {epochs_no_improve}/{early_stop_patience} "

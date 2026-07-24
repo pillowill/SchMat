@@ -59,6 +59,7 @@ os.chdir(project_root)
 from data.data import CIFData, collate_pool
 from utils.data_utils import atoms_to_pyg_data
 from model.attn_rvq import CrystalVQVAE
+from scripts.tokenizer import CrystalVocabConfig, HDSCompiler, bin_formation_energy_10
 
 
 def sanitize_token_name(name: str) -> str:
@@ -90,16 +91,21 @@ def parse_float_or_none(value):
 
 
 def bin_property_value(value: float, bin_size: float = 0.5, origin: float = 0.0,
-                       max_bins: int | None = None) -> int | None:
+                       max_bins: int | None = None, strict_range: bool = False) -> int | None:
     if value is None:
         return None
     if bin_size <= 0:
         raise ValueError(f"property_bin_size must be > 0, got {bin_size}")
     idx = int(floor((value - origin) / bin_size))
-    if idx < 0:
-        idx = 0
-    if max_bins is not None:
-        idx = min(idx, max_bins - 1)
+    if idx < 0 or (max_bins is not None and idx >= max_bins):
+        if strict_range:
+            upper = origin + bin_size * max_bins if max_bins is not None else None
+            raise ValueError(
+                f"Property value {value} is outside [{origin}, {upper})"
+            )
+        idx = max(idx, 0)
+        if max_bins is not None:
+            idx = min(idx, max_bins - 1)
     return idx
 
 
@@ -109,11 +115,24 @@ def build_property_tokens(
         bin_size: float = 0.5,
         bin_origin: float = 0.0,
         max_bins: int = 128,
+        property_scheme: str = "generic",
 ):
     value = parse_float_or_none(property_value)
     if value is None:
+        if property_scheme == "formation_energy_10":
+            raise ValueError(
+                "formation_energy_10 requires a finite formation-energy value; "
+                f"got {property_value!r}"
+            )
         return []
-    bin_idx = bin_property_value(value, bin_size=bin_size, origin=bin_origin, max_bins=max_bins)
+    if property_scheme == "formation_energy_10":
+        if max_bins <= 10:
+            raise ValueError("formation_energy_10 uses token ids 1..10 and requires property_max_bins >= 11")
+        bin_idx = bin_formation_energy_10(value)
+    elif property_scheme == "generic":
+        bin_idx = bin_property_value(value, bin_size=bin_size, origin=bin_origin, max_bins=max_bins)
+    else:
+        raise ValueError(f"Unsupported property scheme: {property_scheme}")
     if bin_idx is None:
         return []
     name_token = sanitize_token_name(property_name)
@@ -236,28 +255,21 @@ def _build_formula_tokens(structure: Structure):
     """
     从 pymatgen Structure 提取化学式，并构造公式相关 token 片段。
 
-    使用现有词表中的：
+    使用当前表示晶胞的完整整数计数，不再约简化学式：
       <FORMULA> <ATOM_X> <COUNT_n> ... </FORMULA>
     """
-    from collections import Counter
-
     tokens = []
     tokens.append("<FORMULA>")
 
-    # 使用 composition 统计化学计量比，并约简为最简整数比
-    comp = structure.composition
-    elem_counter = Counter({str(el): float(amount) for el, amount in comp.get_el_amt_dict().items()})
-    if len(elem_counter) > 0:
-        elems = sorted(elem_counter.keys())
-        counts = np.array([elem_counter[e] for e in elems], dtype=float)
-        # 归一化为最简比例
-        gcd = np.gcd.reduce(counts.astype(int))
-        gcd = int(gcd) if gcd > 0 else 1
-        red_counts = (counts / gcd).astype(int)
-        for elem, c in zip(elems, red_counts):
-            c_int = int(max(c, 1))
-            tokens.append(f"<ATOM_{elem}>")
-            tokens.append(f"<COUNT_{c_int}>")
+    comp = structure.composition.get_el_amt_dict()
+    from pymatgen.core.periodic_table import Element
+
+    for elem in sorted(comp, key=lambda symbol: int(Element(symbol).Z)):
+        amount = float(comp[elem])
+        count = int(round(amount))
+        if count <= 0 or not np.isclose(amount, count):
+            raise ValueError(f"Non-integer full-cell composition for {elem}: {amount}")
+        tokens.extend([f"<ATOM_{elem}>", f"<COUNT_{count}>"])
 
     tokens.append("</FORMULA>")
     return tokens
@@ -274,63 +286,79 @@ def build_crystal_tokens(
         property_bin_size: float = 0.5,
         property_bin_origin: float = 0.0,
         property_max_bins: int = 128,
+        property_scheme: str = "generic",
         include_space_group: bool = False,
         include_crystal_system: bool = False,
         include_coord: bool = False,
 ):
     """
-    构建与 tokenizer 对齐的 DSS-seq token 序列。
+    构建 canonical、Q-tagged、stage-marked HDS token 序列。
 
     默认不输出 <SPACE_GROUP_*>, <CRYSTAL_SYSTEM_*> 和 <COORD_*>。
     如果确实需要兼容旧模板，可通过 include_space_group/include_crystal_system/include_coord 打开。
     """
-    tokens = []
-    tokens.append("<BOS>")
-
-    tokens.append("<CRYSTAL>")
-
-    # === PROPERTY 段：插在 <CRYSTAL> 与 <FORMULA> 之间，作为 DSS-seq 的可选物性条件 ===
-    if property_name is not None:
-        tokens.extend(
-            build_property_tokens(
-                property_value,
-                property_name=property_name,
-                bin_size=property_bin_size,
-                bin_origin=property_bin_origin,
-                max_bins=property_max_bins,
-            )
+    if int(global_attrs.get("num_sites", len(structure))) != len(structure):
+        raise ValueError(
+            f"Attn-RVQ num_sites={global_attrs.get('num_sites')} differs from structure sites={len(structure)}"
+        )
+    if len(local_code_ids) != len(structure):
+        raise ValueError(
+            f"Attn-RVQ local rows={len(local_code_ids)} differs from structure sites={len(structure)}"
         )
 
-    # === FORMULA 段：在 <CRYSTAL> 与 <GLOBAL> 之间插入，用于表示该 CIF 的化学式 ===
-    tokens.extend(_build_formula_tokens(structure))
+    property_tokens = []
+    if property_name is not None:
+        property_tokens = build_property_tokens(
+            property_value,
+            property_name=property_name,
+            bin_size=property_bin_size,
+            bin_origin=property_bin_origin,
+            max_bins=property_max_bins,
+            property_scheme=property_scheme,
+        )
 
-    # === GLOBAL ===
-    tokens.append("<GLOBAL>")
-    for code in global_code_ids:
-        tokens.append(f"<GLOBAL_CODE_{code}>")
-    tokens.append(f"<NUM_SITES_{global_attrs['num_sites']}>")
+    qg = len(global_code_ids)
+    local_lengths = {len(row) for row in local_code_ids}
+    if len(local_lengths) != 1:
+        raise ValueError(f"Ragged local RVQ stages: {sorted(local_lengths)}")
+    ql = next(iter(local_lengths))
+    if qg <= 0 or ql <= 0:
+        raise ValueError(f"Attn-RVQ must provide positive stage counts, got Qg={qg}, Ql={ql}")
+    global_size = max(int(code) for code in global_code_ids) + 1
+    local_size = max(int(code) for row in local_code_ids for code in row) + 1
+    compiler = HDSCompiler(CrystalVocabConfig(
+        num_quantizers_global=qg,
+        codebooksize_global=max(global_size, 1),
+        num_quantizers_local=ql,
+        codebooksize_local=max(local_size, 1),
+        max_sites=max(128, len(structure)),
+        max_formula_count=max(100, len(structure)),
+        include_hds_stage_tokens=True,
+    ))
+    compiled = compiler.compile_from_codes(
+        global_codes=global_code_ids,
+        atom_symbols=[site.specie.symbol for site in structure.sites],
+        local_codes=local_code_ids,
+        property_tokens=property_tokens,
+    )
+    tokens = list(compiled.tokens)
+
+    # Legacy semantic attributes remain opt-in and are outside strict E2 HDS.
+    num_sites_index = tokens.index(f"<NUM_SITES_{len(structure)}>")
+    optional_global_tokens = []
     if include_space_group:
-        tokens.append(f"<SPACE_GROUP_{global_attrs.get('space_group', 'UNKNOWN')}>")
+        optional_global_tokens.append(f"<SPACE_GROUP_{global_attrs.get('space_group', 'UNKNOWN')}>")
     if include_crystal_system:
-        tokens.append(f"<CRYSTAL_SYSTEM_{global_attrs.get('crystal_system', 'UNKNOWN')}>")
-    tokens.append("</GLOBAL>")
-
-    # === SITES ===
-    tokens.append("<SITES>")
-
-    for i, site in enumerate(structure.sites):
-        tokens.append(f"<SITE_{i + 1}>")
-        tokens.append(f"<ATOM_{site.specie.symbol}>")
-        # local_code_ids[i] 是一个列表，可能包含多个 code
-        for code in local_code_ids[i]:
-            tokens.append(f"<LOCAL_CODE_{code}>")
-        if include_coord:
-            tokens.append(f"<COORD_{local_attrs[i]['coord_num']}>")
-        tokens.append(f"</SITE_{i + 1}>")
-
-    tokens.append("</SITES>")
-    tokens.append("</CRYSTAL>")
-    tokens.append("<EOS>")
+        optional_global_tokens.append(f"<CRYSTAL_SYSTEM_{global_attrs.get('crystal_system', 'UNKNOWN')}>")
+    if optional_global_tokens:
+        tokens[num_sites_index + 1:num_sites_index + 1] = optional_global_tokens
+    if include_coord:
+        if len(local_attrs) != len(structure):
+            raise ValueError("Coord tokens require one local_attrs row per structure site")
+        canonical_attrs = [local_attrs[index] for index in compiled.canonical_atom_permutation]
+        for site_index, attrs in enumerate(canonical_attrs, start=1):
+            closing = tokens.index(f"</SITE_{site_index}>")
+            tokens.insert(closing, f"<COORD_{attrs['coord_num']}>")
     return tokens
 
 
@@ -581,6 +609,7 @@ def process_csv_to_tokens(
         property_bin_size: float = 0.5,
         property_bin_origin: float = 0.0,
         property_max_bins: int = 128,
+        property_scheme: str = "generic",
         include_space_group: bool = False,
         include_crystal_system: bool = False,
         include_coord: bool = False,
@@ -677,6 +706,7 @@ def process_csv_to_tokens(
                         property_bin_size=property_bin_size,
                         property_bin_origin=property_bin_origin,
                         property_max_bins=property_max_bins,
+                        property_scheme=property_scheme,
                         include_space_group=include_space_group,
                         include_crystal_system=include_crystal_system,
                         include_coord=include_coord,
@@ -691,13 +721,17 @@ def process_csv_to_tokens(
                             bin_size=property_bin_size,
                             bin_origin=property_bin_origin,
                             max_bins=property_max_bins,
+                            property_scheme=property_scheme,
                         )
                         tokens = insert_property_block(tokens, property_tokens)
 
                 # 处理长度
                 if max_length is not None:
                     if len(tokens) > max_length:
-                        tokens = tokens[:max_length]
+                        raise ValueError(
+                            f"Canonical HDS length {len(tokens)} exceeds max_length={max_length}; "
+                            "truncation is forbidden"
+                        )
                     else:
                         tokens = tokens + ["<PAD>"] * (max_length - len(tokens))
 
@@ -706,6 +740,8 @@ def process_csv_to_tokens(
                 print(f"[Skip {split_name}] idx={source_index}, encode error: {e}")
                 import traceback
                 traceback.print_exc()
+                if property_scheme == "formation_energy_10":
+                    raise
                 continue
         return results
 
@@ -932,6 +968,15 @@ if __name__ == "__main__":
         default=128,
         help="Maximum number of property bins reserved in the tokenizer vocabulary.",
     )
+    parser.add_argument(
+        "--property_scheme",
+        choices=["generic", "formation_energy_10"],
+        default="generic",
+        help=(
+            "Independent property branch. formation_energy_10 maps [-4.5,0.5) "
+            "eV/atom strictly to one-based bins 1..10."
+        ),
+    )
     args = parser.parse_args()
 
     if args.merge_shards:
@@ -971,6 +1016,7 @@ if __name__ == "__main__":
             property_bin_size=args.property_bin_size,
             property_bin_origin=args.property_bin_origin,
             property_max_bins=args.property_max_bins,
+            property_scheme=args.property_scheme,
             include_space_group=args.include_space_group,
             include_crystal_system=args.include_crystal_system,
             include_coord=args.include_coord,

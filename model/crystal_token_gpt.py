@@ -28,6 +28,12 @@ class GPTConfig:
     num_rvq_stages: int = 0
     stage_specific_embeddings: bool = False
     stage_specific_heads: bool = False
+    # E2 keeps the shared LM head and adds codebook-sized auxiliary heads.
+    num_quantizers_global: int = 0
+    num_quantizers_local: int = 0
+    codebooksize_global: int = 0
+    codebooksize_local: int = 0
+    auxiliary_code_heads: bool = False
 
 
 class LayerNorm(nn.Module):
@@ -175,6 +181,16 @@ class GPT(nn.Module):
         super().__init__()
         assert config.vocab_size is not None
         assert config.block_size is not None
+        if config.auxiliary_code_heads:
+            if min(
+                config.num_quantizers_global,
+                config.num_quantizers_local,
+                config.codebooksize_global,
+                config.codebooksize_local,
+            ) <= 0:
+                raise ValueError(
+                    "auxiliary_code_heads requires positive global/local quantizer and codebook sizes"
+                )
         self.config = config
 
         self.transformer = nn.ModuleDict(dict(
@@ -198,6 +214,20 @@ class GPT(nn.Module):
                  for _ in range(config.num_rvq_stages)]
             )
             if config.stage_specific_heads else None
+        )
+        self.global_aux_heads = (
+            nn.ModuleList([
+                nn.Linear(config.n_embd, config.codebooksize_global, bias=False)
+                for _ in range(config.num_quantizers_global)
+            ])
+            if config.auxiliary_code_heads else None
+        )
+        self.local_aux_heads = (
+            nn.ModuleList([
+                nn.Linear(config.n_embd, config.codebooksize_local, bias=False)
+                for _ in range(config.num_quantizers_local)
+            ])
+            if config.auxiliary_code_heads else None
         )
         # https://paperswithcode.com/method/weight-tying
         self.transformer.wte.weight = self.lm_head.weight
@@ -241,6 +271,7 @@ class GPT(nn.Module):
         loss_mask=None,
         attention_mask=None,
         attention_mode=None,
+        return_hidden=False,
     ):
         device = idx.device
         b, t = idx.size()
@@ -289,7 +320,81 @@ class GPT(nn.Module):
             logits = logits[:, [-1], :]
             loss = None
 
+        if return_hidden:
+            return logits, loss, x
         return logits, loss
+
+    def auxiliary_logits(self, hidden: Tensor, kind: str, quantizer: int) -> Tensor:
+        """Classify one RVQ code from its causal stage-marker hidden state."""
+        if kind == "global":
+            heads = self.global_aux_heads
+        elif kind == "local":
+            heads = self.local_aux_heads
+        else:
+            raise ValueError(f"Unsupported auxiliary code kind: {kind}")
+        if heads is None:
+            raise ValueError("Auxiliary code heads are disabled in this checkpoint")
+        if not 0 <= int(quantizer) < len(heads):
+            raise ValueError(f"Auxiliary quantizer out of range: kind={kind}, q={quantizer}")
+        return heads[int(quantizer)](hidden)
+
+    def compute_code_auxiliary(
+        self,
+        hidden: Tensor,
+        code_kinds: Tensor,
+        code_quantizers: Tensor,
+        code_targets: Tensor,
+    ):
+        """Return differentiable E2 losses and analysis counts.
+
+        ``hidden`` and metadata use target-position alignment: the hidden state
+        at a stage-marker position predicts the following code target.
+        Callers therefore pass metadata shifted so the code target's kind/q is
+        aligned with the preceding causal hidden state.
+        """
+        if self.global_aux_heads is None or self.local_aux_heads is None:
+            raise ValueError("compute_code_auxiliary requires auxiliary_code_heads=True")
+
+        zero = hidden.sum() * 0.0
+        global_loss_sum = zero
+        local_loss_sum = zero
+        global_count = 0
+        local_count = 0
+        global_correct = 0
+        local_correct = 0
+        predictions = torch.full_like(code_targets, -1)
+
+        for q, head in enumerate(self.global_aux_heads):
+            positions = (code_kinds == 1) & (code_quantizers == q) & (code_targets >= 0)
+            if positions.any():
+                logits = head(hidden[positions])
+                targets = code_targets[positions]
+                global_loss_sum = global_loss_sum + F.cross_entropy(logits, targets, reduction="sum")
+                pred = logits.argmax(dim=-1)
+                predictions[positions] = pred
+                global_correct += int((pred == targets).sum().item())
+                global_count += int(targets.numel())
+
+        for q, head in enumerate(self.local_aux_heads):
+            positions = (code_kinds == 2) & (code_quantizers == q) & (code_targets >= 0)
+            if positions.any():
+                logits = head(hidden[positions])
+                targets = code_targets[positions]
+                local_loss_sum = local_loss_sum + F.cross_entropy(logits, targets, reduction="sum")
+                pred = logits.argmax(dim=-1)
+                predictions[positions] = pred
+                local_correct += int((pred == targets).sum().item())
+                local_count += int(targets.numel())
+
+        return {
+            "global_loss": global_loss_sum / max(global_count, 1),
+            "local_loss": local_loss_sum / max(local_count, 1),
+            "global_count": global_count,
+            "local_count": local_count,
+            "global_correct": global_correct,
+            "local_correct": local_correct,
+            "predictions": predictions,
+        }
 
     def crop_block_size(self, block_size: int):
         # model surgery to decrease the block size if necessary

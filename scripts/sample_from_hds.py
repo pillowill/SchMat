@@ -1,5 +1,6 @@
 import argparse
 import gzip
+import hashlib
 import json
 import pickle
 import re
@@ -19,16 +20,21 @@ import sys
 
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
-from hds_eval_metrics import OnlineDssMetrics, parse_structure_from_cif_str
+from scripts.tokenizer import CrystalVocabConfig, HDSCompiler, parse_hds_code_token
 
-GLOBAL_RE = re.compile(r"^<GLOBAL_CODE_(\d+)>$")
-LOCAL_RE = re.compile(r"^<LOCAL_CODE_(\d+)>$")
 SITE_START_RE = re.compile(r"^<SITE_(\d+)>$")
 SITE_END_RE = re.compile(r"^</SITE_(\d+)>$")
 ATOM_RE = re.compile(r"^<ATOM_([A-Za-z]{1,2})>$")
 COUNT_RE = re.compile(r"^<COUNT_(\d+)>$")
 PROPERTY_BIN_RE = re.compile(r"^<PROPERTY_BIN_(\d+)>$")
 NUM_SITES_RE = re.compile(r"^<NUM_SITES_(\d+)>$")
+
+
+def parse_structure_from_cif_str(cif_str: str):
+    """Load the optional metrics dependency only when structure analysis is requested."""
+    from scripts.hds_eval_metrics import parse_structure_from_cif_str as parse_impl
+
+    return parse_impl(cif_str)
 
 
 def load_records(path: str) -> List[Dict[str, Any]]:
@@ -66,6 +72,7 @@ def save_results_csv(results: List[Dict[str, Any]], path: str):
             "hds_conditions": rec.get("hds_conditions", 1),
             "diffusion_samples_per_hds": rec.get("diffusion_samples_per_hds"),
             "parallel_diffusion_batch_size": rec.get("parallel_diffusion_batch_size"),
+            "attn_rvq_provenance": json.dumps(rec.get("attn_rvq_provenance", {}), ensure_ascii=False),
         }
         gen_cifs = rec.get("generated_cifs", [])
         for i in range(max_gen):
@@ -90,6 +97,76 @@ def save_results_csv(results: List[Dict[str, Any]], path: str):
     out_path.parent.mkdir(parents=True, exist_ok=True)
     df = pd.DataFrame(rows)
     df.to_csv(out_path, index=False)
+
+
+def validate_attn_rvq_provenance(
+    records: List[Dict[str, Any]],
+    vq_checkpoint: str,
+    vq_config: str,
+) -> Dict[str, Any]:
+    """Reject mixed E2 HDS sources before constructing diffusion conditions."""
+    provenances = {
+        json.dumps(record.get("attn_rvq_provenance", {}), sort_keys=True)
+        for record in records
+        if record.get("attn_rvq_provenance")
+    }
+    if not provenances:
+        print("[Provenance] Input HDS has no Attn-RVQ provenance (legacy data).")
+        return {}
+    if len(provenances) != 1:
+        raise ValueError("Input HDS records mix different Attn-RVQ provenance values")
+    provenance = json.loads(next(iter(provenances)))
+
+    def same_path(declared: Optional[str], actual: str) -> bool:
+        if not declared:
+            return True
+        declared_norm = Path(declared).as_posix().lower()
+        actual_norm = Path(actual).as_posix().lower()
+        return actual_norm.endswith(declared_norm) or declared_norm.endswith(actual_norm)
+
+    def file_signature(actual: str) -> Dict[str, Any]:
+        path = Path(actual)
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return {
+            "available": True,
+            "size": int(path.stat().st_size),
+            "sha256": digest.hexdigest(),
+        }
+
+    def validate_signature(field: str, actual: str) -> None:
+        declared = provenance.get(field)
+        # Legacy E2 outputs may have only path provenance. New outputs carry a
+        # content digest and must match the exact Attn-RVQ artifact used here.
+        if not declared or not declared.get("available"):
+            return
+        actual_signature = file_signature(actual)
+        if (
+            declared.get("size") != actual_signature["size"]
+            or declared.get("sha256") != actual_signature["sha256"]
+        ):
+            raise ValueError(f"HDS {field} differs from the supplied artifact")
+
+    if not same_path(provenance.get("vq_checkpoint"), vq_checkpoint):
+        raise ValueError(
+            f"HDS VQ checkpoint provenance differs from --vq_checkpoint: "
+            f"{provenance.get('vq_checkpoint')} vs {vq_checkpoint}"
+        )
+    if not same_path(provenance.get("vq_config"), vq_config):
+        raise ValueError(
+            f"HDS VQ config provenance differs from --vq_config: "
+            f"{provenance.get('vq_config')} vs {vq_config}"
+        )
+    validate_signature("vq_checkpoint_signature", vq_checkpoint)
+    validate_signature("vq_config_signature", vq_config)
+    if provenance.get("index_reconstructible_from_hds") is False:
+        print(
+            "[Provenance] alpha-weighted Attn-RVQ is not exactly reconstructible from indices; "
+            "diffusion uses the configured index-derived approximation."
+        )
+    return provenance
 
 
 def parse_vq_indices_from_tokens(tokens: List[str]) -> Tuple[
@@ -120,9 +197,14 @@ def parse_vq_indices_from_tokens(tokens: List[str]) -> Tuple[
             in_global = False
             continue
         if in_global:
-            m = GLOBAL_RE.match(tok)
-            if m:
-                global_codes.append(int(m.group(1)))
+            parsed = parse_hds_code_token(tok)
+            if parsed and parsed[0] == "global":
+                _, quantizer, code = parsed
+                if quantizer is not None and quantizer != len(global_codes):
+                    raise ValueError(
+                        f"Global Q stages must be consecutive: got Q{quantizer} at position {len(global_codes)}"
+                    )
+                global_codes.append(code)
 
     current_site = None
     for tok in tokens:
@@ -136,22 +218,23 @@ def parse_vq_indices_from_tokens(tokens: List[str]) -> Tuple[
             current_site = None
             continue
         if current_site is not None:
-            m_local = LOCAL_RE.match(tok)
-            if m_local:
-                local_codes_per_site[current_site].append(int(m_local.group(1)))
+            parsed = parse_hds_code_token(tok)
+            if parsed and parsed[0] == "local":
+                _, quantizer, code = parsed
+                expected_q = len(local_codes_per_site[current_site])
+                if quantizer is not None and quantizer != expected_q:
+                    raise ValueError(
+                        f"Site {current_site} local Q stages must be consecutive: "
+                        f"got Q{quantizer} at position {expected_q}"
+                    )
+                local_codes_per_site[current_site].append(code)
 
     return global_codes, local_codes_per_site, property_bin, num_sites
 
 
-def align_code_list(codes: List[int], expected_len: int, pad_value: int = 0) -> List[int]:
-    if expected_len <= 0:
-        return list(codes)
-    if len(codes) >= expected_len:
-        return list(codes[:expected_len])
-    return list(codes) + [pad_value] * (expected_len - len(codes))
-
-
 def parse_formula_from_tokens(tokens: List[str]) -> List[Tuple[str, int]]:
+    if tokens.count("<FORMULA>") != 1 or tokens.count("</FORMULA>") != 1:
+        raise ValueError("HDS must contain exactly one complete FORMULA block")
     in_formula = False
     parsed: List[Tuple[str, int]] = []
     pending_atom: Optional[str] = None
@@ -172,44 +255,53 @@ def parse_formula_from_tokens(tokens: List[str]) -> List[Tuple[str, int]]:
 
         m_cnt = COUNT_RE.match(tok)
         if m_cnt and pending_atom is not None:
-            parsed.append((pending_atom, max(1, int(m_cnt.group(1)))))
+            count = int(m_cnt.group(1))
+            if count <= 0:
+                raise ValueError(f"Formula count must be positive for {pending_atom}: {count}")
+            parsed.append((pending_atom, count))
             pending_atom = None
 
+    if pending_atom is not None:
+        raise ValueError("FORMULA ends with an ATOM token without COUNT")
     return parsed
 
 
-def composition_to_atom_numbers(parsed_formula: List[Tuple[str, int]]) -> List[int]:
-    if not parsed_formula:
-        return []
+def parse_site_atoms(tokens: List[str]) -> List[str]:
+    """Read the explicit site atom skeleton; no formula-derived repair is allowed."""
+    atoms_by_site: Dict[int, str] = {}
+    cursor = 0
+    while cursor < len(tokens):
+        opening = SITE_START_RE.fullmatch(tokens[cursor])
+        if opening is None:
+            cursor += 1
+            continue
+        site_index = int(opening.group(1))
+        closing = f"</SITE_{site_index}>"
+        try:
+            end = tokens.index(closing, cursor + 1)
+        except ValueError as exc:
+            raise ValueError(f"Unclosed site block {site_index}") from exc
+        matches = [ATOM_RE.fullmatch(token) for token in tokens[cursor + 1:end]]
+        symbols = [match.group(1) for match in matches if match is not None]
+        if len(symbols) != 1:
+            raise ValueError(f"Site {site_index} must contain exactly one ATOM token")
+        if site_index in atoms_by_site:
+            raise ValueError(f"Duplicate site block {site_index}")
+        atoms_by_site[site_index] = symbols[0]
+        cursor = end + 1
+    expected_ids = list(range(1, len(atoms_by_site) + 1))
+    if sorted(atoms_by_site) != expected_ids:
+        raise ValueError("Site ids must be consecutive from 1 to NUM_SITES")
+    return [atoms_by_site[index] for index in expected_ids]
 
-    try:
-        from pymatgen.core.periodic_table import Element
 
-        out = []
-        for sym, cnt in parsed_formula:
-            z = int(Element(sym).Z)
-            out.extend([z] * cnt)
-        return out
-    except Exception:
-        # Fallback to a safe placeholder when element table is unavailable.
-        return []
+def atom_symbols_to_numbers(atom_symbols: List[str]) -> torch.Tensor:
+    """Convert validated site atoms to atomic numbers without a fallback element."""
+    from pymatgen.core.periodic_table import Element
 
-
-def build_atom_types_from_formula_or_sites(parsed_formula: List[Tuple[str, int]], n_sites: int) -> torch.Tensor:
-    atom_numbers = composition_to_atom_numbers(parsed_formula)
-
-    if n_sites <= 0:
-        n_sites = max(1, len(atom_numbers))
-
-    if len(atom_numbers) == 0:
-        # fallback: Si
-        atom_numbers = [14] * n_sites
-    elif len(atom_numbers) > n_sites:
-        atom_numbers = atom_numbers[:n_sites]
-    elif len(atom_numbers) < n_sites:
-        atom_numbers = atom_numbers + [atom_numbers[0]] * (n_sites - len(atom_numbers))
-
-    return torch.tensor(atom_numbers, dtype=torch.long)
+    if not atom_symbols:
+        raise ValueError("HDS contains no site atom skeleton")
+    return torch.tensor([int(Element(symbol).Z) for symbol in atom_symbols], dtype=torch.long)
 
 
 def group_hds_records_by_id(
@@ -229,7 +321,7 @@ def group_hds_records_by_id(
 
     grouped: Dict[str, List[Dict[str, Any]]] = {}
     for row_index, record in enumerate(records):
-        record_id = str(record.get("id", record.get("prompt_id", f"sample_{row_index}")))
+        record_id = str(record.get("prompt_id", record.get("id", f"sample_{row_index}")))
         grouped.setdefault(record_id, []).append(record)
 
     invalid_counts = {
@@ -262,34 +354,74 @@ def build_hds_sampling_condition(
     global_codes, local_codes_per_site, property_bin, num_sites_tok = (
         parse_vq_indices_from_tokens(tokens)
     )
+    num_site_tokens = [token for token in tokens if NUM_SITES_RE.fullmatch(token)]
+    if len(num_site_tokens) != 1:
+        raise ValueError(f"Expected exactly one NUM_SITES token, got {len(num_site_tokens)}")
     if not global_codes or not local_codes_per_site:
         raise ValueError("Missing GLOBAL/LOCAL code tokens")
 
-    if strict_code_shape and len(global_codes) != qg:
+    if len(global_codes) != qg:
         raise ValueError(
             f"Global code length mismatch: got {len(global_codes)}, expected {qg}"
         )
-    global_codes = align_code_list(global_codes, qg, pad_value=0)
 
     site_ids = sorted(local_codes_per_site.keys())
-    n_sites = num_sites_tok if (num_sites_tok is not None and num_sites_tok > 0) else len(site_ids)
+    if num_sites_tok is None or num_sites_tok <= 0:
+        raise ValueError("Missing or invalid NUM_SITES token")
+    n_sites = num_sites_tok
+    if site_ids != list(range(1, n_sites + 1)):
+        raise ValueError(
+            f"Site blocks must be exactly 1..{n_sites}, got {site_ids[:10]}"
+        )
     local_rows = []
     for site_id in range(1, n_sites + 1):
         row = local_codes_per_site.get(site_id, [])
-        if strict_code_shape and len(row) != ql:
+        if len(row) != ql:
             raise ValueError(
                 f"Local code length mismatch at site {site_id}: got {len(row)}, expected {ql}"
             )
-        local_rows.append(align_code_list(row, ql, pad_value=0))
+        local_rows.append(list(row))
     if not local_rows:
-        raise ValueError("No valid local rows after alignment")
+        raise ValueError("No valid local rows")
 
     parsed_formula = parse_formula_from_tokens(tokens)
-    atom_types = build_atom_types_from_formula_or_sites(
-        parsed_formula, n_sites=len(local_rows)
-    )
+    atom_symbols = parse_site_atoms(tokens)
+    if len(atom_symbols) != n_sites:
+        raise ValueError(
+            f"Site atom count mismatch: atoms={len(atom_symbols)}, NUM_SITES={n_sites}"
+        )
+    from collections import Counter
+
+    formula_counter = Counter({symbol: count for symbol, count in parsed_formula})
+    if len(formula_counter) != len(parsed_formula):
+        raise ValueError("FORMULA contains duplicate elements")
+    if formula_counter != Counter(atom_symbols):
+        raise ValueError(
+            f"FORMULA/site composition mismatch: formula={dict(formula_counter)}, "
+            f"sites={dict(Counter(atom_symbols))}"
+        )
+
+    # Q-tagged E2 output must equal the compiler's canonical form exactly.
+    if any(token.startswith("<STAGE_") or "_CODE_Q" in token for token in tokens):
+        compiler = HDSCompiler(CrystalVocabConfig(
+            num_quantizers_global=qg,
+            codebooksize_global=max(global_codes) + 1,
+            num_quantizers_local=ql,
+            codebooksize_local=max(code for row in local_rows for code in row) + 1,
+            max_sites=max(128, n_sites),
+            max_formula_count=max(100, n_sites),
+            include_hds_stage_tokens=True,
+        ))
+        compiled = compiler.parse_strict_record(tokens)
+        parsed_formula = compiled.composition_counts
+        atom_symbols = compiled.atom_symbols
+        global_codes = compiled.global_codes
+        local_rows = compiled.local_codes
+
+    atom_types = atom_symbols_to_numbers(atom_symbols)
     return {
         "formula_composition": parsed_formula,
+        "atom_symbols": atom_symbols,
         "property_bin": property_bin,
         "atom_types": atom_types,
         "indices_g": torch.tensor(global_codes, dtype=torch.long, device=device).unsqueeze(0),
@@ -434,7 +566,7 @@ def parse_args():
     parser.add_argument("--cond_checkpoint", type=str, required=True, help="Pretrained CondDiffusion checkpoint.")
     parser.add_argument("--vq_checkpoint", type=str, required=True, help="Pretrained CrystalVQVAE checkpoint.")
     parser.add_argument("--vq_config", type=str, required=True, help="CrystalVQVAE training config yaml.")
-    parser.add_argument("--out_path", type=str, default="results/dss_samples/sampled_from_dss.csv")
+    parser.add_argument("--out_path", type=str, default="results/dss_samples/sampled_from_dss_1.csv")
     parser.add_argument("--n_samples", type=int, default=5, help="Diffusion samples per HDS condition.")
     parser.add_argument(
         "--group_hds_by_id",
@@ -482,11 +614,11 @@ def parse_args():
     parser.add_argument("--property_bin_override", type=int, default=-1,
                         help="If >=0, override DSS property bin for all records.")
     parser.add_argument("--expected_global_codes", type=int, default=0,
-                        help="If >0, force global code length by pad/trunc.")
+                        help="If >0, require exactly this many global codes; no padding/truncation is performed.")
     parser.add_argument("--expected_local_codes", type=int, default=0,
-                        help="If >0, force per-site local code length by pad/trunc.")
+                        help="If >0, require exactly this many local codes per site; no repair is performed.")
     parser.add_argument("--strict_code_shape", action="store_true",
-                        help="If set, raise on ragged/missing code shape instead of pad/trunc.")
+                        help="Deprecated compatibility flag; exact code shape is now always enforced.")
     parser.add_argument("--enable_online_metrics", action="store_true",
                         help="(Deprecated alias) Enable evaluation metrics during sampling.")
     parser.add_argument(
@@ -632,6 +764,11 @@ def main():
     )
 
     records = load_records(args.dss_path)
+    hds_attn_rvq_provenance = validate_attn_rvq_provenance(
+        records,
+        vq_checkpoint=args.vq_checkpoint,
+        vq_config=args.vq_config,
+    )
     raw_hds_record_count = len(records)
     if args.group_hds_by_id:
         records = group_hds_records_by_id(
@@ -698,6 +835,8 @@ def main():
     online_metrics_total = None
     online_metrics_window = None
     if compute_eval_metrics:
+        from scripts.hds_eval_metrics import OnlineDssMetrics
+
         t0 = time.time()
         if not args.reference_test_csv:
             raise ValueError("--compute_eval_metrics requires --reference_test_csv")
@@ -851,6 +990,7 @@ def main():
                 "hds_conditions": len(conditions),
                 "diffusion_samples_per_hds": diffusion_repeats,
                 "parallel_diffusion_batch_size": expected_sample_count,
+                "attn_rvq_provenance": hds_attn_rvq_provenance,
             }
             if not args.metrics_only:
                 res_record["generated_cifs"] = cif_list
@@ -1065,7 +1205,7 @@ CUDA_VISIBLE_DEVICES=3 python scripts/sample_from_hds.py \
   --no_compute_eval_metrics \
   --save_skipped_ids results/random_dss_samples/bg/mp_20_bg7/skipped_ids.txt \
   --save_skipped_reasons results/random_dss_samples/bg/mp_20_bg7/skipped_reasons.csv \
-  --out_path results/random_dss_samples/bg/mp_20_bg7/sampled_from_dss.csv \
+  --out_path results/random_dss_samples/bg/mp_20_bg7/sampled_from_dss_1.csv \
   --bandgap_relax \
   --bandgap_relax_save_dir results/random_dss_samples/bg/mp_20_bg7/bandgap_relaxed_cifs \
   --max_records 1000
@@ -1087,7 +1227,7 @@ CUDA_VISIBLE_DEVICES=3 python scripts/sample_from_hds.py \
   --dss_path dataset/mp_20/gen_random_DSS-seqs-fe/random_property_fe10_10000.pkl.gz \
   --save_skipped_ids results/random_dss_samples/fe/mp_20_fe10/skipped_ids.txt \
   --save_skipped_reasons results/random_dss_samples/fe/mp_20_fe10/skipped_reasons.csv \
-  --out_path results/random_dss_samples/fe/mp_20_fe10/sampled_from_dss.csv \
+  --out_path results/random_dss_samples/fe/mp_20_fe10/sampled_from_dss_1.csv \
   --calc_formation_energy \
   --max_records 1000 \
     """

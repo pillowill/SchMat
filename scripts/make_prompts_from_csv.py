@@ -16,8 +16,9 @@ def structure_formula_from_cif(cif_str: str) -> str:
         st = parser.parse_structures(primitive=True)[0]
     except Exception:
         st = parser.get_structures()[0]
-    # reduced_formula 更稳定、可读（如 SrTiO3）
-    return st.composition.reduced_formula
+    # CSP skeleton must describe every site in the represented cell.  Using a
+    # reduced formula here would recreate the formula/site mismatch fixed by E2.
+    return st.composition.formula
 
 
 def build_formula_tokens(formula: str) -> List[str]:
@@ -27,17 +28,17 @@ def build_formula_tokens(formula: str) -> List[str]:
     """
     from pymatgen.core import Composition
 
-    comp = Composition(formula)
-    elems = sorted(comp.get_el_amt_dict().keys())
-    counts = [int(round(float(comp[e]))) for e in elems]
-    # 约简为最简整数比
-    from math import gcd
+    comp = Composition(formula).get_el_amt_dict()
+    from pymatgen.core.periodic_table import Element
 
-    g = counts[0] if counts else 1
-    for c in counts[1:]:
-        g = gcd(g, c)
-    g = g if g > 0 else 1
-    counts = [max(1, c // g) for c in counts]
+    elems = sorted(comp, key=lambda symbol: int(Element(symbol).Z))
+    counts = []
+    for elem in elems:
+        amount = float(comp[elem])
+        count = int(round(amount))
+        if count <= 0 or abs(amount - count) > 1e-6:
+            raise ValueError(f"Full-cell composition for {elem} is not a positive integer: {amount}")
+        counts.append(count)
 
     tokens: List[str] = ["<BOS>", "<CRYSTAL>", "<FORMULA>"]
     for e, c in zip(elems, counts):
@@ -45,6 +46,42 @@ def build_formula_tokens(formula: str) -> List[str]:
         tokens.append(f"<COUNT_{int(c)}>")
     tokens.append("</FORMULA>")
     return tokens
+
+
+def add_property_prompt_tokens(
+    prompt_tokens: List[str],
+    value: Any,
+    property_name: str,
+    property_scheme: str,
+) -> tuple[List[str], int | None]:
+    """Insert the independent property condition immediately after CRYSTAL."""
+    if property_scheme == "none":
+        return prompt_tokens, None
+    if property_scheme != "formation_energy_10":
+        raise ValueError(f"Unsupported property scheme: {property_scheme}")
+    if value is None or pd.isna(value):
+        raise ValueError("Missing formation-energy value for a conditional CSP prompt")
+    from scripts.tokenizer import bin_formation_energy_10, sanitize_token_name
+
+    property_bin = bin_formation_energy_10(float(value))
+    property_tokens = [
+        "<PROPERTY>",
+        f"<PROPERTY_NAME_{sanitize_token_name(property_name)}>",
+        f"<PROPERTY_BIN_{property_bin}>",
+        "</PROPERTY>",
+    ]
+    updated = list(prompt_tokens)
+    updated[2:2] = property_tokens
+    return updated, property_bin
+
+
+def composition_counts_from_prompt(prompt_tokens: List[str]) -> List[Dict[str, Any]]:
+    """Return structured full-cell counts from the already validated FORMULA block."""
+    return [
+        {"symbol": token[6:-1], "count": int(prompt_tokens[index + 1][7:-1])}
+        for index, token in enumerate(prompt_tokens)
+        if token.startswith("<ATOM_") and index + 1 < len(prompt_tokens)
+    ]
 
 
 def parse_args():
@@ -91,6 +128,14 @@ def parse_args():
         default=0,
         help="If >0 and not --strict, print traceback for first N errors.",
     )
+    parser.add_argument(
+        "--property_scheme",
+        choices=["none", "formation_energy_10"],
+        default="none",
+        help="Optional independent conditional branch for strict one-based formation-energy bins 1..10.",
+    )
+    parser.add_argument("--property_col", type=str, default="formation_energy_per_atom")
+    parser.add_argument("--property_name", type=str, default="FORMATION_ENERGY_PER_ATOM")
     return parser.parse_args()
 
 
@@ -146,10 +191,18 @@ def main():
                 # 直接抛异常，便于定位问题
                 formula = structure_formula_from_cif(cif_str)
                 prompt_tokens = build_formula_tokens(formula)
+                prompt_tokens, property_bin = add_property_prompt_tokens(
+                    prompt_tokens,
+                    row.get(args.property_col, None),
+                    args.property_name,
+                    args.property_scheme,
+                )
                 record: Dict[str, Any] = {
                     "id": sample_id,
                     "formula": formula,
                     "prompt_tokens": prompt_tokens,
+                    "composition_counts": composition_counts_from_prompt(prompt_tokens),
+                    "property_bin": property_bin,
                 }
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
                 num_ok += 1
@@ -157,14 +210,24 @@ def main():
                 try:
                     formula = structure_formula_from_cif(cif_str)
                     prompt_tokens = build_formula_tokens(formula)
+                    prompt_tokens, property_bin = add_property_prompt_tokens(
+                        prompt_tokens,
+                        row.get(args.property_col, None),
+                        args.property_name,
+                        args.property_scheme,
+                    )
                     record: Dict[str, Any] = {
                         "id": sample_id,
                         "formula": formula,
                         "prompt_tokens": prompt_tokens,
+                        "composition_counts": composition_counts_from_prompt(prompt_tokens),
+                        "property_bin": property_bin,
                     }
                     f.write(json.dumps(record, ensure_ascii=False) + "\n")
                     num_ok += 1
                 except Exception as e:
+                    if args.property_scheme == "formation_energy_10":
+                        raise
                     num_skip += 1
                     if args.print_errors and args.print_errors > 0 and num_skip <= args.print_errors:
                         import traceback

@@ -22,8 +22,6 @@ def save_pickle(obj: Any, path: str):
         pickle.dump(obj, f)
 
 
-GLOBAL_RE = re.compile(r"^<GLOBAL_CODE_(\d+)>$")
-LOCAL_RE = re.compile(r"^<LOCAL_CODE_(\d+)>$")
 PROPERTY_BIN_RE = re.compile(r"^<PROPERTY_BIN_(\d+)>$")
 SITE_START_RE = re.compile(r"^<SITE_(\d+)>$")
 SITE_END_RE = re.compile(r"^</SITE_(\d+)>$")
@@ -41,8 +39,11 @@ def parse_vq_indices_from_tokens(tokens: List[str]):
       property_bin: Optional[int]
     """
     global_codes: List[int] = []
+    global_quantizers: List[int | None] = []
     local_codes_per_site: Dict[int, List[int]] = {}
+    local_quantizers_per_site: Dict[int, List[int | None]] = {}
     property_bin = None
+    from scripts.tokenizer import parse_hds_code_token
 
     for tok in tokens:
         m_prop = PROPERTY_BIN_RE.match(tok)
@@ -58,9 +59,11 @@ def parse_vq_indices_from_tokens(tokens: List[str]):
         if tok == "</GLOBAL>":
             in_global = False
         if in_global:
-            m = GLOBAL_RE.match(tok)
-            if m:
-                global_codes.append(int(m.group(1)))
+            parsed = parse_hds_code_token(tok)
+            if parsed and parsed[0] == "global":
+                _, quantizer, code = parsed
+                global_codes.append(code)
+                global_quantizers.append(quantizer)
 
     current_site = None
     for tok in tokens:
@@ -69,17 +72,26 @@ def parse_vq_indices_from_tokens(tokens: List[str]):
             current_site = int(m_start.group(1))
             if current_site not in local_codes_per_site:
                 local_codes_per_site[current_site] = []
+                local_quantizers_per_site[current_site] = []
             continue
         m_end = SITE_END_RE.match(tok)
         if m_end:
             current_site = None
             continue
         if current_site is not None:
-            m_local = LOCAL_RE.match(tok)
-            if m_local:
-                local_codes_per_site[current_site].append(int(m_local.group(1)))
+            parsed = parse_hds_code_token(tok)
+            if parsed and parsed[0] == "local":
+                _, quantizer, code = parsed
+                local_codes_per_site[current_site].append(code)
+                local_quantizers_per_site[current_site].append(quantizer)
 
-    return global_codes, local_codes_per_site, property_bin
+    return (
+        global_codes,
+        local_codes_per_site,
+        property_bin,
+        global_quantizers,
+        local_quantizers_per_site,
+    )
 
 
 def parse_args():
@@ -194,7 +206,13 @@ def main():
         if not tokens or not isinstance(tokens, list):
             continue
 
-        global_codes, local_codes_per_site, property_bin = parse_vq_indices_from_tokens(tokens)
+        (
+            global_codes,
+            local_codes_per_site,
+            property_bin,
+            global_quantizers,
+            local_quantizers_per_site,
+        ) = parse_vq_indices_from_tokens(tokens)
         if len(global_codes) == 0 or len(local_codes_per_site) == 0:
             # 没有找到任何 code token，跳过
             continue
@@ -207,6 +225,9 @@ def main():
                     skipped_ids.append(str(sample_id))
                     continue
                 raise ValueError(msg)
+        if any(q is not None for q in global_quantizers):
+            if global_quantizers != list(range(len(global_quantizers))):
+                raise ValueError(f"id={sample_id}: invalid global Q order {global_quantizers}")
         indices_g = torch.tensor(global_codes, dtype=torch.long, device=device).unsqueeze(0)  # (1, G)
 
         site_indices = sorted(local_codes_per_site.keys())
@@ -248,16 +269,24 @@ def main():
                         break
                     raise ValueError(msg)
             local_rows.append(codes_s)
+            quantizers_s = local_quantizers_per_site.get(s_idx, [])
+            if any(q is not None for q in quantizers_s):
+                if quantizers_s != list(range(len(quantizers_s))):
+                    raise ValueError(
+                        f"id={sample_id}: invalid local Q order at site={s_idx}: {quantizers_s}"
+                    )
         if not local_rows:
             continue
         indices_l = torch.tensor(local_rows, dtype=torch.long, device=device)  # (S, L)
 
         rec: Dict[str, Any] = {
             "id": sample_id,          # base id（通常是 material_id）
-            "gen_id": raw_id,         # 原始生成 id（例如 mp-31117__gen_0）
+            "gen_id": sample.get("candidate_id", raw_id),
             "indices_g": indices_g.cpu(),
             "indices_l": indices_l.cpu(),
             "property_bin": property_bin,
+            "global_quantizers": global_quantizers,
+            "local_quantizers": [local_quantizers_per_site[index] for index in site_indices],
             "tokens": tokens,
         }
 
