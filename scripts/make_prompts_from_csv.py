@@ -11,11 +11,16 @@ def structure_formula_from_cif(cif_str: str) -> str:
     from io import StringIO
 
     parser = CifParser(StringIO(cif_str))
-    # 新版 pymatgen 推荐 parse_structures（避免 get_structures 的弃用告警）
-    try:
-        st = parser.parse_structures(primitive=True)[0]
-    except Exception:
-        st = parser.get_structures()[0]
+    # Newer pymatgen versions prefer parse_structures.  Fall back only when
+    # that API is absent: malformed CIF errors must reach the caller instead
+    # of being mistaken for a version-compatibility condition.
+    parse_structures = getattr(parser, "parse_structures", None)
+    if parse_structures is None:
+        st = parser.get_structures(primitive=False)[0]
+    else:
+        # E2 preserves the input CIF's current cell.  Reducing to a primitive
+        # cell would recreate the formula/site mismatch with full-cell HDS.
+        st = parse_structures(primitive=False)[0]
     # CSP skeleton must describe every site in the represented cell.  Using a
     # reduced formula here would recreate the formula/site mismatch fixed by E2.
     return st.composition.formula

@@ -23,9 +23,201 @@ def save_pickle(obj: Any, path: str):
         pickle.dump(obj, f)
 
 
+def generation_manifest_path(output_path: Path) -> Path:
+    """Keep shard provenance adjacent to, but outside of, the legacy pickle format."""
+    return Path(f"{output_path}.manifest.json")
+
+
+def load_pickle(path: Path) -> Any:
+    opener = gzip.open if str(path).endswith(".gz") else open
+    with opener(path, "rb") as f:
+        return pickle.load(f)
+
+
+def file_sha256(path: Path) -> str:
+    """Return a content identity for artifacts shared by parallel shards."""
+    digest = hashlib.sha256()
+    with path.open("rb") as f:
+        for block in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def optional_file_signature(path_value: str) -> Optional[Dict[str, str]]:
+    """Describe an optional analysis artifact without silently accepting a missing file."""
+    if not path_value:
+        return None
+    path = Path(path_value)
+    if not path.is_file():
+        raise FileNotFoundError(f"Configured analysis artifact does not exist: {path}")
+    return {"path": str(path.resolve()), "sha256": file_sha256(path)}
+
+
+def _validate_shard_arguments(args) -> None:
+    if args.num_shards < 1:
+        raise ValueError(f"--num_shards must be >= 1, got {args.num_shards}")
+    if not 0 <= args.shard_index < args.num_shards:
+        raise ValueError(
+            f"--shard_index must be in [0, {args.num_shards}), got {args.shard_index}"
+        )
+    if args.random_mode and args.num_shards != 1:
+        raise ValueError("Prompt sharding is only defined for --prompts_path generation, not --random_mode")
+
+
+def merge_generation_shards(shard_paths: List[str], output_path: str, metrics_path: str = "") -> None:
+    """Merge a complete, compatible set of prompt shards with provenance checks.
+
+    The output remains a plain list of HDS records, so downstream diffusion code
+    can keep reading it unchanged.  The sidecar manifest carries validation data.
+    """
+    if not shard_paths:
+        raise ValueError("--merge_shards requires at least one shard path")
+
+    records: List[Dict[str, Any]] = []
+    manifests: List[Dict[str, Any]] = []
+    for raw_path in shard_paths:
+        shard_path = Path(raw_path)
+        if not shard_path.is_file():
+            raise FileNotFoundError(f"Shard output does not exist: {shard_path}")
+        manifest_path = generation_manifest_path(shard_path)
+        if not manifest_path.is_file():
+            raise FileNotFoundError(f"Shard manifest does not exist: {manifest_path}")
+        shard_records = load_pickle(shard_path)
+        if not isinstance(shard_records, list):
+            raise ValueError(f"Shard is not a list of HDS records: {shard_path}")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if manifest.get("format_version") != 1:
+            raise ValueError(f"Unsupported shard manifest format: {manifest_path}")
+        if int(manifest.get("result_count", -1)) != len(shard_records):
+            raise ValueError(f"Shard record count does not match manifest: {shard_path}")
+        prompt_ids = manifest.get("prompt_ids", [])
+        if not isinstance(prompt_ids, list) or len(prompt_ids) != len(set(prompt_ids)):
+            raise ValueError(f"Shard manifest has invalid or duplicate prompt IDs: {manifest_path}")
+        prompt_id_set = set(prompt_ids)
+        record_keys = set()
+        per_prompt_indices: Dict[str, set] = {prompt_id: set() for prompt_id in prompt_ids}
+        for record in shard_records:
+            if not isinstance(record, dict):
+                raise ValueError(f"Shard contains a non-dictionary HDS record: {shard_path}")
+            prompt_id = str(record.get("prompt_id", ""))
+            if prompt_id not in prompt_id_set:
+                raise ValueError(f"Shard record has an undeclared prompt ID {prompt_id!r}: {shard_path}")
+            candidate_index = int(record.get("candidate_index", 0))
+            record_key = (prompt_id, candidate_index)
+            if record_key in record_keys:
+                raise ValueError(f"Shard repeats candidate {record_key}: {shard_path}")
+            record_keys.add(record_key)
+            per_prompt_indices[prompt_id].add(candidate_index)
+        expected_candidates = int(manifest.get("expected_candidates_per_prompt", 0))
+        if expected_candidates > 0:
+            expected_indices = set(range(expected_candidates))
+            incomplete = [
+                prompt_id for prompt_id, indices in per_prompt_indices.items()
+                if indices != expected_indices
+            ]
+            if incomplete:
+                preview = ", ".join(incomplete[:10])
+                raise ValueError(
+                    f"Shard lacks the complete candidate set for {len(incomplete)} prompts "
+                    f"(first: {preview}): {shard_path}"
+                )
+        records.extend(shard_records)
+        manifests.append(manifest)
+
+    first = manifests[0]
+    expected_shards = int(first.get("num_shards", 0))
+    if expected_shards < 1 or len(manifests) != expected_shards:
+        raise ValueError(
+            f"Expected exactly {expected_shards} shards, received {len(manifests)}. "
+            "Do not merge a partial generation."
+        )
+    comparable_keys = (
+        "generation_mode",
+        "checkpoint",
+        "prompts_path",
+        "generation_config",
+        "total_prompt_count",
+        "expected_candidates_per_prompt",
+        "checkpoint_sha256",
+        "prompts_sha256",
+        "analysis_artifacts",
+    )
+    for manifest in manifests[1:]:
+        if int(manifest.get("num_shards", 0)) != expected_shards:
+            raise ValueError("Shard manifests disagree on --num_shards")
+        for key in comparable_keys:
+            if manifest.get(key) != first.get(key):
+                raise ValueError(f"Shard manifests disagree on {key}; refusing to mix generation runs")
+
+    shard_indices = [int(manifest.get("shard_index", -1)) for manifest in manifests]
+    if sorted(shard_indices) != list(range(expected_shards)):
+        raise ValueError(
+            f"Shard indices must be exactly 0..{expected_shards - 1}, got {sorted(shard_indices)}"
+        )
+
+    seen_prompt_ids = set()
+    for manifest in manifests:
+        for prompt_id in manifest.get("prompt_ids", []):
+            if prompt_id in seen_prompt_ids:
+                raise ValueError(f"Prompt {prompt_id!r} appears in more than one shard")
+            seen_prompt_ids.add(prompt_id)
+    if len(seen_prompt_ids) != int(first.get("total_prompt_count", -1)):
+        raise ValueError(
+            "Merged prompt IDs do not cover the source prompt set; refusing incomplete generation"
+        )
+
+    records.sort(
+        key=lambda rec: (str(rec.get("prompt_id", rec.get("id", ""))), int(rec.get("candidate_index", 0)))
+    )
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    save_pickle(records, str(output))
+
+    merged_manifest = {
+        "format_version": 1,
+        "merged": True,
+        "source_shards": [str(Path(path)) for path in shard_paths],
+        "num_shards": expected_shards,
+        "prompt_count": len(seen_prompt_ids),
+        "result_count": len(records),
+        "generation_mode": first.get("generation_mode"),
+        "checkpoint": first.get("checkpoint"),
+        "checkpoint_sha256": first.get("checkpoint_sha256"),
+        "prompts_path": first.get("prompts_path"),
+        "prompts_sha256": first.get("prompts_sha256"),
+        "generation_config": first.get("generation_config"),
+        "analysis_artifacts": first.get("analysis_artifacts"),
+    }
+    merged_metric_totals = None
+    if first.get("metric_totals") is not None:
+        merged_metric_totals = {key: 0.0 for key in first["metric_totals"]}
+        for manifest in manifests:
+            metric_totals = manifest.get("metric_totals")
+            if not isinstance(metric_totals, dict) or set(metric_totals) != set(merged_metric_totals):
+                raise ValueError("Shard manifests have incompatible metric accumulators")
+            for key, value in metric_totals.items():
+                merged_metric_totals[key] += float(value)
+        metrics = finalize_csp_metrics(merged_metric_totals)
+        metrics.update({
+            "generation_mode": first["generation_mode"],
+            **first["generation_config"],
+        })
+        final_metrics_path = Path(metrics_path) if metrics_path else output.with_suffix(".metrics.json")
+        final_metrics_path.parent.mkdir(parents=True, exist_ok=True)
+        final_metrics_path.write_text(json.dumps(metrics, indent=2, sort_keys=True), encoding="utf-8")
+        merged_manifest["metrics_path"] = str(final_metrics_path)
+        merged_manifest["metric_totals"] = merged_metric_totals
+    generation_manifest_path(output).write_text(
+        json.dumps(merged_manifest, indent=2, sort_keys=True), encoding="utf-8"
+    )
+    print(f"[Merged] {len(shard_paths)} shards, {len(records)} HDS records -> {output}")
+    if merged_metric_totals is not None:
+        print(f"[Merged] analysis metrics -> {merged_manifest['metrics_path']}")
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Load pretrained crystal_token_gpt and generate DSS-seq from prompts or random hyperparameter-controlled prompts.")
-    parser.add_argument("--checkpoint", type=str, required=True, help="Path to best_cry2seq.pt")
+    parser.add_argument("--checkpoint", type=str, default="", help="Path to best_cry2seq.pt")
     parser.add_argument("--prompts_path", type=str, default="", help="Prompt file path (.jsonl) from make_prompts_from_csv.py")
     parser.add_argument("--out_path", type=str, default="results/gpt_tokens/generated_from_prompts.pkl.gz", help="Output pkl(.gz)")
     parser.add_argument("--max_new_tokens", type=int, default=256, help="Max new tokens to generate after prompt")
@@ -91,6 +283,24 @@ def parse_args():
         type=str,
         default="",
         help="Optional Attn-RVQ YAML paired with --vq_checkpoint.",
+    )
+    parser.add_argument(
+        "--num_shards",
+        type=int,
+        default=1,
+        help="Deterministically partition prompt records into this many disjoint shards.",
+    )
+    parser.add_argument(
+        "--shard_index",
+        type=int,
+        default=0,
+        help="Zero-based prompt shard index handled by this process.",
+    )
+    parser.add_argument(
+        "--merge_shards",
+        nargs="+",
+        default=None,
+        help="Merge generated shard pkl(.gz) files. This mode does not require --checkpoint.",
     )
     return parser.parse_args()
 
@@ -719,6 +929,17 @@ def finalize_csp_metrics(totals: Dict[str, float]) -> Dict[str, float]:
 
 def main():
     args = parse_args()
+    if args.merge_shards is not None:
+        merge_generation_shards(args.merge_shards, args.out_path, args.metrics_path)
+        return
+    _validate_shard_arguments(args)
+    if not args.checkpoint:
+        raise ValueError("--checkpoint is required unless --merge_shards is used")
+    if args.num_shards > 1 and args.num_generations > 0:
+        raise ValueError(
+            "--num_generations is incompatible with prompt sharding because it can create "
+            "an incomplete merged dataset"
+        )
     device = torch.device(args.device if (args.device == "cpu" or torch.cuda.is_available()) else "cpu")
 
     project_root = Path(__file__).resolve().parent.parent
@@ -885,15 +1106,42 @@ def main():
                 if args.max_prompts and args.max_prompts > 0 and len(prompt_records) >= args.max_prompts:
                     break
 
-        total_recs = len(prompt_records)
-        pbar = tqdm(prompt_records, total=total_recs, desc="Generating", unit="prompt")
+        total_prompt_count = len(prompt_records)
+        indexed_prompt_records = list(enumerate(prompt_records))
+        all_prompt_ids = [
+            str(rec.get("id", f"prompt_{source_index}"))
+            for source_index, rec in indexed_prompt_records
+        ]
+        if len(all_prompt_ids) != len(set(all_prompt_ids)):
+            raise ValueError("Prompt IDs must be globally unique before deterministic sharding")
+        indexed_prompt_records = indexed_prompt_records[args.shard_index::args.num_shards]
+        shard_prompt_ids = [
+            str(rec.get("id", f"prompt_{source_index}"))
+            for source_index, rec in indexed_prompt_records
+        ]
+        if len(shard_prompt_ids) != len(set(shard_prompt_ids)):
+            raise ValueError("Prompt IDs must be unique before deterministic sharding")
+        if generation_mode == "constrained_csp" and reference_hds:
+            missing_reference_ids = [prompt_id for prompt_id in shard_prompt_ids if prompt_id not in reference_hds]
+            if missing_reference_ids:
+                preview = ", ".join(missing_reference_ids[:10])
+                raise ValueError(
+                    f"{len(missing_reference_ids)} prompt IDs have no direct-HDS reference "
+                    f"(first: {preview}). Refuse to generate an unaligned CSP split."
+                )
+        total_recs = len(indexed_prompt_records)
+        print(
+            f"[Shard] {args.shard_index + 1}/{args.num_shards}: "
+            f"{total_recs}/{total_prompt_count} prompt records"
+        )
+        pbar = tqdm(indexed_prompt_records, total=total_recs, desc="Generating", unit="prompt")
         
-        for rec in pbar:
+        for source_index, rec in pbar:
             prompt_tokens = rec.get("prompt_tokens", None)
             if not isinstance(prompt_tokens, list) or len(prompt_tokens) == 0:
                 continue
 
-            prompt_id = str(rec.get("id", f"prompt_{n_read}"))
+            prompt_id = str(rec.get("id", f"prompt_{source_index}"))
             formula = rec.get("formula", None)
 
             if generation_mode == "constrained_csp":
@@ -1030,6 +1278,57 @@ def main():
     out_path = Path(args.out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     save_pickle(results, str(out_path))
+    if not args.random_mode:
+        effective_num_candidates = int(
+            args.num_candidates if args.num_candidates > 0 else ckpt.get("num_candidates", 5)
+        )
+        if effective_num_candidates <= 0:
+            effective_num_candidates = 5
+        generation_config = {
+            "temperature": float(args.temperature),
+            "top_k": int(args.top_k),
+            "top_p": float(args.top_p),
+            "num_candidates": int(args.num_candidates),
+            "effective_num_candidates": effective_num_candidates,
+            "candidate_oversample": int(args.candidate_oversample),
+            "mmr_lambda": float(args.mmr_lambda),
+            "beta_aux": float(args.beta_aux),
+            "max_new_tokens": int(args.max_new_tokens),
+            "num_samples_per_prompt": int(args.num_samples_per_prompt),
+            "canonicalize_candidates": bool(args.canonicalize_candidates),
+            "deduplicate_candidates": bool(args.deduplicate_candidates),
+            "allow_unk": bool(args.allow_unk),
+            "early_stop_eos": bool(args.early_stop_eos),
+            "use_smact_filter": bool(args.use_smact_filter),
+        }
+        shard_manifest = {
+            "format_version": 1,
+            "merged": False,
+            "num_shards": int(args.num_shards),
+            "shard_index": int(args.shard_index),
+            "total_prompt_count": int(total_prompt_count),
+            "prompt_ids": shard_prompt_ids,
+            "result_count": len(results),
+            "generation_mode": generation_mode,
+            "checkpoint": str(ckpt_path.resolve()),
+            "checkpoint_sha256": file_sha256(ckpt_path),
+            "prompts_path": str(Path(args.prompts_path).resolve()),
+            "prompts_sha256": file_sha256(Path(args.prompts_path)),
+            "generation_config": generation_config,
+            "expected_candidates_per_prompt": (
+                effective_num_candidates if generation_mode == "constrained_csp" else 0
+            ),
+            "analysis_artifacts": {
+                "reference_hds": optional_file_signature(args.reference_hds_path),
+                "vq_checkpoint": optional_file_signature(args.vq_checkpoint),
+                "vq_config": optional_file_signature(args.vq_config),
+            },
+            "metric_totals": metric_totals if generation_mode == "constrained_csp" else None,
+        }
+        generation_manifest_path(out_path).write_text(
+            json.dumps(shard_manifest, indent=2, sort_keys=True), encoding="utf-8"
+        )
+        print(f"[Shard] manifest -> {generation_manifest_path(out_path)}")
     if generation_mode == "constrained_csp":
         metrics = finalize_csp_metrics(metric_totals)
         metrics.update({
