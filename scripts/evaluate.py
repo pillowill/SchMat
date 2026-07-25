@@ -271,7 +271,13 @@ def evaluate_generation(
             cif_io = StringIO(cif_str)
             try:
                 parser = CifParser(cif_io)
-                struct = parser.get_structures()[0]
+                # Keep evaluation references in the full/current-cell
+                # representation used throughout the rebuilt pipeline.
+                parse_structures = getattr(parser, "parse_structures", None)
+                if parse_structures is None:
+                    struct = parser.get_structures(primitive=False)[0]
+                else:
+                    struct = parse_structures(primitive=False)[0]
             except Exception:
                 continue
             cif_id = cry.get("material_id", cry.get("id", None))

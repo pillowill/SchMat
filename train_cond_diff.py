@@ -10,6 +10,7 @@
     -> CondDiffusion.forward(batch)  (内部再映射为 VQ 连续向量并做 cond-drop)
 """
 import argparse
+import hashlib
 import os
 import random
 from pathlib import Path
@@ -67,6 +68,118 @@ def as_bool(value, default: bool = False) -> bool:
         if s in {"0", "false", "no", "n", "off"}:
             return False
     return default
+
+
+def _candidate_rank(record: dict) -> int | None:
+    """Return a parsed HDS candidate rank, when the record carries one."""
+    value = record.get("candidate_rank", record.get("gen_id", None))
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        # Generated HDS commonly stores either an integer rank or ``<id>__gen_N``.
+        if value.isdigit():
+            return int(value)
+        for marker in ("__gen_", "__hds_"):
+            if marker in value:
+                suffix = value.rsplit(marker, 1)[-1]
+                if suffix.isdigit():
+                    return int(suffix)
+    return None
+
+
+def load_vq_index_table(indices_path: str, *, candidate_rank: int | None = None) -> dict:
+    """Load parsed HDS indices keyed by material ID.
+
+    ``candidate_rank=None`` retains the legacy single-record behaviour.  When
+    a rank is supplied, exactly that candidate is selected for every ID.  This
+    prevents the previous silent last-record overwrite when a file contains
+    five HDS candidates per prompt.
+    """
+    import gzip
+    import pickle
+
+    path = Path(indices_path)
+    assert path.is_file(), f"HDS indices path not found: {path}"
+    opener = gzip.open if str(path).endswith(".gz") else open
+    with opener(path, "rb") as f:
+        records = pickle.load(f)
+
+    table = {}
+    unavailable_ranks = set()
+    for record in records:
+        material_id = record.get("id", None)
+        if material_id is None:
+            continue
+        material_id = str(material_id)
+        if not material_id:
+            continue
+
+        rank = _candidate_rank(record)
+        if candidate_rank is not None and rank != candidate_rank:
+            if rank is not None:
+                unavailable_ranks.add(rank)
+            continue
+        if material_id in table:
+            if candidate_rank is None:
+                # Preserve historical single-source behaviour for old runs.
+                table[material_id] = record
+                continue
+            raise ValueError(
+                f"Duplicate HDS record for id={material_id!r} at candidate rank "
+                f"{candidate_rank!r} in {path}."
+            )
+        table[material_id] = record
+
+    if candidate_rank is not None and not table:
+        raise ValueError(
+            f"No candidate rank {candidate_rank} records found in {path}; "
+            f"available ranks: {sorted(unavailable_ranks)}"
+        )
+    return table
+
+
+def build_mixed_hds_table(
+    direct_table: dict,
+    predicted_table: dict,
+    *,
+    predicted_ratio: float,
+    seed: int,
+    epoch: int,
+) -> tuple[dict, dict]:
+    """Select one direct or rank-fixed predicted HDS for each training ID.
+
+    The source decision is deterministic for a given ``(seed, epoch, id)``.
+    Thus each training pass sees only one HDS per crystal while source ratios
+    can be changed reproducibly between ablation runs.  A missing selected
+    source is an error rather than silently falling back to another condition.
+    """
+    if not 0.0 <= predicted_ratio <= 1.0:
+        raise ValueError(f"predicted_hds_ratio must lie in [0, 1], got {predicted_ratio}")
+
+    ids = sorted(set(direct_table) | set(predicted_table))
+    selected = {}
+    counts = {"direct": 0, "predicted": 0}
+    missing = []
+    for material_id in ids:
+        digest = hashlib.sha256(f"{seed}:{epoch}:{material_id}".encode("utf-8")).digest()
+        score = int.from_bytes(digest[:8], byteorder="big") / float(1 << 64)
+        use_predicted = score < predicted_ratio
+        source = "predicted" if use_predicted else "direct"
+        record = predicted_table.get(material_id) if use_predicted else direct_table.get(material_id)
+        if record is None:
+            missing.append(f"{material_id} ({source})")
+            continue
+        selected[material_id] = record
+        counts[source] += 1
+
+    if missing:
+        preview = ", ".join(missing[:8])
+        raise KeyError(
+            f"Selected HDS source is missing for {len(missing)} IDs; first entries: {preview}"
+        )
+    return selected, counts
 
 
 def load_pretrained_vqvae(checkpoint_path: str, config_path: str, device: torch.device):
@@ -622,6 +735,16 @@ def main():
         help="(Optional) GPT indices for test split. This script currently trains with train+val only, "
              "but the option is kept for future test evaluation/sampling hooks.",
     )
+    parser.add_argument("--direct_indices_path_train", type=str, default=None)
+    parser.add_argument("--direct_indices_path_val", type=str, default=None)
+    parser.add_argument("--predicted_indices_path_train", type=str, default=None)
+    parser.add_argument("--predicted_indices_path_val", type=str, default=None)
+    parser.add_argument(
+        "--predicted_hds_ratio",
+        type=float,
+        default=None,
+        help="Training probability of using the fixed-rank predicted HDS instead of direct HDS.",
+    )
     parser.add_argument(
         "--skip_missing_gpt_indices",
         action="store_true",
@@ -737,25 +860,64 @@ def main():
         )
 
     def load_gpt_indices(indices_path: str) -> dict:
-        """Load GPT VQ indices record list -> dict(id->rec) for fast lookup."""
-        import gzip
-        import pickle
+        """Compatibility wrapper for historical single-source GPT experiments."""
+        return load_vq_index_table(indices_path)
 
-        indices_path_p = Path(indices_path)
-        assert indices_path_p.is_file(), f"gpt_indices_path not found: {indices_path_p}"
-        opener = gzip.open if str(indices_path_p).endswith(".gz") else open
-        with opener(indices_path_p, "rb") as f:
-            records = pickle.load(f)
-        gpt_dict = {}
-        for rec in records:
-            rid = rec.get("id", None)
-            if rid is None:
-                continue
-            rid = str(rid)
-            if not rid:
-                continue
-            gpt_dict[rid] = rec
-        return gpt_dict
+    # Explicit HDS-source mode for direct/predicted source-ratio ablations.
+    # Every source file is split-specific; generated files are fixed to rank-0
+    # before the train-time direct/predicted source choice is made.
+    direct_path_train = args.direct_indices_path_train or config.get("direct_indices_path_train")
+    direct_path_val = args.direct_indices_path_val or config.get("direct_indices_path_val")
+    predicted_path_train = args.predicted_indices_path_train or config.get("predicted_indices_path_train")
+    predicted_path_val = args.predicted_indices_path_val or config.get("predicted_indices_path_val")
+    predicted_ratio = (
+        args.predicted_hds_ratio
+        if args.predicted_hds_ratio is not None
+        else float(config.get("predicted_hds_ratio", 0.0))
+    )
+    predicted_candidate_rank = int(config.get("predicted_hds_candidate_rank", 0))
+    hds_mix_seed = int(config.get("hds_mix_seed", config.get("random_seed", 42)))
+    validation_hds_source = str(config.get("validation_hds_source", "predicted")).lower()
+    explicit_hds_mode = any(
+        path is not None
+        for path in (direct_path_train, direct_path_val, predicted_path_train, predicted_path_val)
+    )
+
+    direct_indices_train = direct_indices_val = None
+    predicted_indices_train = predicted_indices_val = None
+    if explicit_hds_mode:
+        required_paths = {
+            "direct_indices_path_train": direct_path_train,
+            "direct_indices_path_val": direct_path_val,
+            "predicted_indices_path_train": predicted_path_train,
+            "predicted_indices_path_val": predicted_path_val,
+        }
+        missing_paths = [name for name, path in required_paths.items() if not path]
+        if missing_paths:
+            raise ValueError(
+                "Explicit direct/predicted HDS mode requires all train/val paths; missing: "
+                + ", ".join(missing_paths)
+            )
+        direct_indices_train = load_vq_index_table(direct_path_train)
+        direct_indices_val = load_vq_index_table(direct_path_val)
+        predicted_indices_train = load_vq_index_table(
+            predicted_path_train, candidate_rank=predicted_candidate_rank
+        )
+        predicted_indices_val = load_vq_index_table(
+            predicted_path_val, candidate_rank=predicted_candidate_rank
+        )
+        if validation_hds_source not in {"direct", "predicted"}:
+            raise ValueError("validation_hds_source must be 'direct' or 'predicted'")
+        print(
+            "[Info] Explicit HDS source mode: "
+            f"train predicted_ratio={predicted_ratio:.3f}, predicted_rank={predicted_candidate_rank}, "
+            f"val_source={validation_hds_source}."
+        )
+        print(
+            "[Info] HDS table sizes: "
+            f"direct train/val={len(direct_indices_train)}/{len(direct_indices_val)}, "
+            f"predicted train/val={len(predicted_indices_train)}/{len(predicted_indices_val)}."
+        )
 
     # offline GPT indices (optional, split-aware)
     # 优先级：命令行参数 > 配置文件 > 旧参数（兼容）
@@ -924,6 +1086,28 @@ def main():
         print(f"\n{'='*60}")
         print(f"Epoch {epoch + 1}/{config.get('num_epochs', 50)}")
         print(f"{'='*60}")
+
+        if explicit_hds_mode:
+            train_condition_indices, source_counts = build_mixed_hds_table(
+                direct_indices_train,
+                predicted_indices_train,
+                predicted_ratio=predicted_ratio,
+                seed=hds_mix_seed,
+                epoch=epoch,
+            )
+            val_condition_indices = (
+                predicted_indices_val
+                if validation_hds_source == "predicted"
+                else direct_indices_val
+            )
+            print(
+                "[HDS source] train one-HDS-per-ID: "
+                f"direct={source_counts['direct']}, predicted(rank={predicted_candidate_rank})="
+                f"{source_counts['predicted']}; val={validation_hds_source}."
+            )
+        else:
+            train_condition_indices = gpt_indices_train
+            val_condition_indices = gpt_indices_val
         
         # 训练一个 epoch，返回总损失和各子损失 / 误差
         train_loss, train_metrics = train_epoch(
@@ -933,7 +1117,7 @@ def main():
             device,
             pretrained_vqvae=pretrained_vqvae,
             grad_clip=config.get("grad_clip", None),
-            gpt_indices=gpt_indices_train,
+            gpt_indices=train_condition_indices,
             skip_missing_gpt_indices=args.skip_missing_gpt_indices,
             use_gpt_precomputed_vq_vectors=use_gpt_precomputed_vq_vectors,
             property_cond_enabled=bool(config.get("property_cond_enabled", False)),
@@ -949,7 +1133,7 @@ def main():
                 val_loader,
                 device,
                 pretrained_vqvae=pretrained_vqvae,
-                gpt_indices=gpt_indices_val,
+                gpt_indices=val_condition_indices,
                 skip_missing_gpt_indices=args.skip_missing_gpt_indices,
                 use_gpt_precomputed_vq_vectors=use_gpt_precomputed_vq_vectors,
                 property_cond_enabled=bool(config.get("property_cond_enabled", False)),

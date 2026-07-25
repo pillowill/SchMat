@@ -405,7 +405,15 @@ class CIFData(Dataset):
             try:
                 cif_io = StringIO(cry['cif'])
                 parser = CifParser(cif_io)
-                structure = parser.get_structures()[0]
+                # Representation contract: all model inputs use the CIF's
+                # current/full cell.  The legacy ``get_structures()`` API
+                # implicitly returns a primitive structure in pymatgen, which
+                # would desynchronise graph natoms from the HDS prompt formula.
+                parse_structures = getattr(parser, "parse_structures", None)
+                if parse_structures is None:
+                    structure = parser.get_structures(primitive=False)[0]
+                else:
+                    structure = parse_structures(primitive=False)[0]
             except Exception as e:
                 self._log_bad_cif(str(cif_id), f"CIFParseError:{type(e).__name__}")
                 if retry == max_retry - 1:
@@ -454,6 +462,5 @@ class CIFData(Dataset):
             'property': proper,
         }
         return data_dict, cif_id
-
 
 

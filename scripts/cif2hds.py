@@ -673,8 +673,16 @@ def process_csv_to_tokens(
                 # 获取 cif_id
                 cif_id = cry.get('material_id', cry.get('id', f'crystal_{source_index}'))
 
-                # 解析结构
-                structure = CifParser(StringIO(cif_str)).get_structures()[0]
+                # Parse the CIF's current/full cell.  This must match the
+                # prompt composition and the Attn-RVQ/diffusion graph input;
+                # legacy ``get_structures()`` would silently reduce to a
+                # primitive structure in current pymatgen releases.
+                parser = CifParser(StringIO(cif_str))
+                parse_structures = getattr(parser, "parse_structures", None)
+                if parse_structures is None:
+                    structure = parser.get_structures(primitive=False)[0]
+                else:
+                    structure = parse_structures(primitive=False)[0]
 
                 # 可选：从 CSV 表头读取物性并离散化
                 property_value = None

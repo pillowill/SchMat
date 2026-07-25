@@ -1,126 +1,102 @@
-# 运行命令示例：
-#   python train_cond_diff.py --config config/train_cond_diffusion_carbon_24.yaml --save_dir ckpt/mp_20/cond_diffusion
-#   启用 wandb: CUDA_VISIBLE_DEVICES=3 python train_cond_diff.py --config config/data/train_cond_diffusion_mpts_52.yaml --wandb --save_dir ckpts/mpts_52/cond_diffusion
+# MPTS-52 conditional diffusion using the E2 canonical HDS conditions.
+# The predicted HDS files are generated from the five-candidate E2 model;
+# training and validation use only canonical candidate rank 0 per structure.
 
-# ==================== Wandb Configuration ====================
 wandb:
-  project: cond_diffusion              # Wandb 项目名
-  run_name: mpts_52_0.0.6_VQ                          # Wandb run 名（null 表示自动生成）
+  project: cond_diffusion
+  run_name: mpts_52_e2_hds_multiscale_film
 
-# ==================== Data Configuration ====================
+# Dataset and loaders
 use_single_csv: false
-csv_file: data.csv
-batch_size: 256  # 批次大小
-data_path: dataset/mpts_52                    # 数据根目录，包含 train/val/test CSV
-train_csv: train.csv                        # 训练集 CSV 文件名
-val_csv: val.csv                            # 验证集 CSV 文件名
-test_csv: test.csv                          # 测试集 CSV 文件名
-return_test: false                          # 是否加载测试集 DataLoader
-property: formation_energy                  # CIFData 使用的性质键
-random_seed: 42                             # 随机种子
+data_path: dataset/mpts_52
+train_csv: train.csv
+val_csv: val.csv
+test_csv: test.csv
+return_test: false
+property: formation_energy
+random_seed: 42
+train_batch_size: 64
+val_batch_size: 128
+test_batch_size: 128
+workers: 0
+pin_memory: true
 
-# ==================== DataLoader Configuration ====================
-train_batch_size: 64                       # 训练集 batch_size
-val_batch_size: 128                         # 验证集 batch_size
-test_batch_size: 128                        # 测试集 batch_size
-workers: 0                                  # 数据加载线程数
-pin_memory: true                            # DataLoader 是否 pin_memory
-
-# ==================== Pretrained Model ====================
-pretrained_vqvae_path: ckpts/mpts_52/attn_rvq-VQ/best_model.pth  # 预训练 CrystalVQVAE 权重路径
-pretrained_vqvae_config: config/attn_rvq/train_cryvqvae_mpts_52.yaml  # 训练该 VQVAE 时使用的 yaml 配置（用于匹配架构）
-
-# 预训练 VQVAE 聚合器参数（需与训练配置一致；留空则使用默认）
+# The k=256 Attn-RVQ model used to encode HDS VQ indices.
+pretrained_vqvae_path: experiments/mpts_52/k256_lr3e-4_attn_rvq_b64_restart/checkpoints/best_model.pth
+pretrained_vqvae_config: config/attn_rvq/train_cryvqvae_mpts_52_k256_lr3e-4.yaml
 aggregator_attn_dropout: 0.2
 aggregator_use_positional: true
 aggregator_positional_scale: 1.0
-
-# If your GPT-to-VQ parsing output already contains precomputed continuous VQ vectors (z_g/z_l),
-# set this to true to feed those vectors directly to the diffusion model conditions.
 use_gpt_precomputed_vq_vectors: false
 gpt_indices_path_train: null
 gpt_indices_path_val: null
 gpt_indices_path_test: null
-gpt_indices_dir: dataset/mpts_52/DSS2indices
-filter_skipped_ids_before_training: true
+gpt_indices_dir: null
+filter_skipped_ids_before_training: false
 
-# ==================== Optimization ====================
-learning_rate: 1.0e-3                       # 学习率
-# ==================== Scheme A: finetune VQ-VAE aggregators only ====================
-finetune_vqvae_aggregator: false             # 只联合微调 VQ-VAE 的注意力聚合器（其余 VQ-VAE 参数冻结）
-vqvae_agg_lr: 1.0e-6                        # 聚合器学习率（建议 < learning_rate，例如 learning_rate * 0.1）
-weight_decay: 0                        # 权重衰减
-min_lr: 1.0e-7                              # 学习率最小值（CosineAnnealingLR）
-num_epochs: 500                              # 训练轮数（最大训练轮数，early stopping 可能提前结束）
-grad_clip: 1.0                              # 梯度裁剪（None 表示不裁剪）
+# Direct HDS is extracted from the structure; predicted HDS comes from the E2
+# generator.  One source is drawn per training ID per epoch.  Validation is
+# intentionally fixed to predicted canonical rank 0 for stable, deployment-like
+# model selection across the mixture-ratio experiments.
+direct_indices_path_train: experiments/mpts_52/k256_lr3e-4_cond_diffusion_hds/conditions/direct_train_indices.pkl.gz
+direct_indices_path_val: experiments/mpts_52/k256_lr3e-4_cond_diffusion_hds/conditions/direct_val_indices.pkl.gz
+predicted_indices_path_train: experiments/mpts_52/k256_lr3e-4_cond_diffusion_hds/conditions/predicted_rank0_train_indices.pkl.gz
+predicted_indices_path_val: experiments/mpts_52/k256_lr3e-4_cond_diffusion_hds/conditions/predicted_rank0_val_indices.pkl.gz
+predicted_hds_ratio: 0.0
+predicted_hds_candidate_rank: 0
+hds_mix_seed: 42
+validation_hds_source: predicted
 
-# ==================== Learning Rate Scheduler ====================
-scheduler: cosine                            # 学习率调度器：cosine, plateau, step, constant
-# CosineAnnealingLR 参数
-cosine_T_max: null                          # CosineAnnealingLR 的 T_max（null 表示使用 num_epochs）
-# ReduceLROnPlateau 参数
-plateau_mode: min                           # ReduceLROnPlateau 的模式：min, max
-plateau_factor: 0.5                         # ReduceLROnPlateau 的学习率衰减因子
-plateau_patience: 10                        # ReduceLROnPlateau 的 patience
-plateau_threshold: 1e-4                     # ReduceLROnPlateau 的阈值
-plateau_cooldown: 0                         # ReduceLROnPlateau 的 cooldown
-# StepLR 参数
-step_size: 30                               # StepLR 的 step_size
-step_gamma: 0.1                             # StepLR 的 gamma
+# Optimisation
+learning_rate: 3.0e-4
+weight_decay: 1.0e-6
+min_lr: 1.0e-7
+num_epochs: 3000
+grad_clip: 1.0
+finetune_vqvae_aggregator: false
+vqvae_agg_lr: 1.0e-6
+scheduler: cosine
+cosine_T_max: null
+plateau_mode: min
+plateau_factor: 0.5
+plateau_patience: 10
+plateau_threshold: 1.0e-4
+plateau_cooldown: 0
+step_size: 30
+step_gamma: 0.1
+early_stopping: true
+early_stopping_patience: 200
+early_stopping_min_delta: 1.0e-4
+early_stopping_mode: min
+save_every: 500
 
-# ==================== Early Stopping ====================
-early_stopping: false                        # 是否启用 early stopping
-early_stopping_patience: 20000000                 # Early stopping 的 patience（验证损失不改善的轮数）
-early_stopping_min_delta: 0.0001               # Early stopping 的最小改善阈值
-early_stopping_mode: min                    # Early stopping 的模式：min（验证损失越小越好）, max（验证指标越大越好）
+# Diffusion process and classifier-free conditioning
+timesteps: 1000
+beta_schedule: cosine
+diffuse_atom_types: false
+max_atoms: 104
+d3pm_hybrid_coeff: 1.0
+cond_guide: true
+cond_drop_prob: 0.1
 
-# ==================== Checkpoint Saving ====================
-save_every: 250                              # 每 N 个 epoch 保存一次检查点（0 表示不保存定期检查点）
+# CSPNet decoder and HDS conditioning architecture
+time_dim: 512
+hidden_dim: 512
+cond_dim: 512
+num_layers: 6
+act_fn: silu
+dis_emb: sin
+num_freqs: 128
+edge_style: fc
+cutoff: 6.0
+max_neighbors: 20
+ln: true
+ip: true
+smooth: false
+pred_atom_types: false
+use_multiscale_film: true
 
-# ==================== Diffusion Process ====================
-timesteps: 1000                             # 扩散时间步数
-beta_schedule: cosine                        # Beta 调度方式：linear, cosine
-diffuse_atom_types: false                    # 是否扩散原子类型
-                                              #   true: 同时扩散原子类型、晶格和坐标（使用 D3PM）
-                                              #   false: 只扩散晶格和坐标，原子类型固定（类似 DiffCSP）
-max_atoms: 104                              # 103 atoms + 1 for dummy atom
-                                              # 最大原子数（D3PM，仅在 diffuse_atom_types=true 时使用）
-d3pm_hybrid_coeff: 1.0                      # D3PM 混合系数（0.0 表示只用 VB loss，仅在 diffuse_atom_types=true 时使用）
-
-# ==================== Conditional Guidance ====================
-cond_guide: true                            # 启用条件引导（必须为 true）
-cond_drop_prob: 0.2                         # 条件 drop 概率（用于 classifier-free guidance）
-
-# ==================== Model Architecture ====================
-# Time embedding
-time_dim: 512                               # 时间嵌入维度
-
-# CSPNet Decoder
-hidden_dim: 512                             # 隐藏层维度
-cond_dim: 512                              # 条件嵌入维度（应与预训练 VQVAE 的 hidden_dim 匹配）
-num_layers: 6                               # CSPNet 层数
-act_fn: silu                                # 激活函数：silu, relu
-dis_emb: sin                                # 距离嵌入：sin, none
-num_freqs: 128                               # 位置编码频率数
-edge_style: fc                              # 边连接方式：fc (全连接), knn
-cutoff: 6.0                                 # 邻居搜索截断半径（knn 模式）
-max_neighbors: 20                           # 最大邻居数（knn 模式）
-ln: true                                   # 是否使用 LayerNorm
-ip: true                                    # 是否使用不变点（equivariant features）
-smooth: false                                # 是否使用平滑激活
-                                              #   true: 同时扩散原子类型、晶格和坐标
-                                              #   false: 只扩散晶格和坐标，原子类型固定
-#smooth=True 只在你把 atom_types 作为 one-hot（形状 [N, max_atoms] 的实值向量）输入时才适用。代码里：
-#smooth=True -> self.node_embedding = nn.Linear(max_atoms, hidden_dim)，要求输入是长度 max_atoms 的连续向量（典型就是 one-hot 或 soft-one-hot）。
-#smooth=False -> self.node_embedding = nn.Embedding(max_atoms, hidden_dim)，要求输入是整数索引（如原子序数）。
-#你当前传入的是原子序数（整数索引），因此应保持 smooth=False。只有当你预先把原子类型编码成 one-hot/soft-one-hot 时才需要设为 True。
-pred_atom_types: false                      # 是否预测原子类型
-                                              #   true: 同时扩散原子类型、晶格和坐标（使用 D3PM）
-
-use_multiscale_film: false
-
-# ==================== Loss Weights ====================
-cost_atom_types: 1.0                        # 原子类型损失权重
-cost_lattice: 1.0                           # 晶格损失权重
-cost_coords: 1.0                            # 坐标损失权重
-
+# Loss weights
+cost_atom_types: 1.0
+cost_lattice: 1.0
+cost_coords: 1.0

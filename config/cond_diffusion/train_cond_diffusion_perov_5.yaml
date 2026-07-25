@@ -25,8 +25,8 @@ workers: 0                                  # 数据加载线程数
 pin_memory: true                            # DataLoader 是否 pin_memory
 
 # ==================== Pretrained Model ====================
-pretrained_vqvae_path: ckpts/perov_5/attn_rvq-VQ/best_model.pth  # 预训练 CrystalVQVAE 权重路径
-pretrained_vqvae_config: config/attn_rvq/train_cryvqvae_perov_5.yaml  # 训练该 VQVAE 时使用的 yaml 配置（用于匹配架构）
+pretrained_vqvae_path: experiments/perov_5/k256_lr3e-4_attn_rvq/checkpoints/best_model.pth  # k=256 Attn-RVQ 权重
+pretrained_vqvae_config: config/attn_rvq/train_cryvqvae_perov_5_k256_lr3e-4.yaml  # 与上述权重严格匹配的架构配置
 
 use_gpt_precomputed_vq_vectors: false
 gpt_indices_path_train: null
@@ -35,8 +35,21 @@ gpt_indices_path_test: null
 gpt_indices_dir: null
 filter_skipped_ids_before_training: false
 
+# ==================== HDS Condition Source ====================
+# 训练阶段每个结构只使用一个 HDS。direct/predicted 的选择由
+# predicted_hds_ratio 控制；predicted HDS 固定取 canonical rank-0。
+# 验证固定使用 rank-0 predicted HDS，以获得稳定且接近部署场景的 val loss。
+direct_indices_path_train: experiments/perov_5/k256_lr3e-4_cond_diffusion_hds/conditions/direct_train_indices.pkl.gz
+direct_indices_path_val: experiments/perov_5/k256_lr3e-4_cond_diffusion_hds/conditions/direct_val_indices.pkl.gz
+predicted_indices_path_train: experiments/perov_5/k256_lr3e-4_cond_diffusion_hds/conditions/predicted_rank0_train_indices.pkl.gz
+predicted_indices_path_val: experiments/perov_5/k256_lr3e-4_cond_diffusion_hds/conditions/predicted_rank0_val_indices.pkl.gz
+predicted_hds_ratio: 0.0                 # 首轮：0% predicted / 100% direct
+predicted_hds_candidate_rank: 0
+hds_mix_seed: 42
+validation_hds_source: predicted
+
 # ==================== Optimization ====================
-learning_rate: 1.0e-2                       # 学习率
+learning_rate: 3.0e-4                       # 所有 perov HDS 条件扩散对比统一使用的学习率
 # ==================== Scheme A: finetune VQ-VAE aggregators only ====================
 finetune_vqvae_aggregator: false             # 只联合微调 VQ-VAE 的注意力聚合器（其余 VQ-VAE 参数冻结）
 vqvae_agg_lr: 1.0e-6                        # 聚合器学习率（建议 < learning_rate，例如 learning_rate * 0.1）
@@ -60,8 +73,8 @@ step_size: 30                               # StepLR 的 step_size
 step_gamma: 0.1                             # StepLR 的 gamma
 
 # ==================== Early Stopping ====================
-early_stopping: false                        # 是否启用 early stopping
-early_stopping_patience: 20000000                 # Early stopping 的 patience（验证损失不改善的轮数）
+early_stopping: true                         # 依据验证损失启用 early stopping
+early_stopping_patience: 200                 # 验证损失连续 200 轮未改善时停止
 early_stopping_min_delta: 0.0001               # Early stopping 的最小改善阈值
 early_stopping_mode: min                    # Early stopping 的模式：min（验证损失越小越好）, max（验证指标越大越好）
 
@@ -80,7 +93,7 @@ d3pm_hybrid_coeff: 1.0                      # D3PM 混合系数（0.0 表示只�
 
 # ==================== Conditional Guidance ====================
 cond_guide: true                            # 启用条件引导（必须为 true）
-cond_drop_prob: 0.2                         # 条件 drop 概率（用于 classifier-free guidance）
+cond_drop_prob: 0.1                         # 所有 perov HDS 条件扩散对比统一的 CFG 条件丢弃概率
 
 # ==================== Model Architecture ====================
 # Time embedding
@@ -115,4 +128,4 @@ cost_atom_types: 1.0                        # 原子类型损失权重
 cost_lattice: 1.0                           # 晶格损失权重
 cost_coords: 1.0                            # 坐标损失权重
 
-use_multiscale_film: false
+use_multiscale_film: true                  # 局部条件作用于前 2 层、全局条件作用于后 3 层（6 层网络的默认分配）

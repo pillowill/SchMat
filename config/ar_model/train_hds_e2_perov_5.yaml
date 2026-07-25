@@ -7,7 +7,8 @@ train_file: train_tokens.pkl.gz
 val_file: val_tokens.pkl.gz
 test_file: test_tokens.pkl.gz
 max_seq_len: 256
-batch_size: 128
+# E2 uses a two-pass self-conditioning step, so 8GB RTX 3070 cards OOM at 128.
+batch_size: 64
 num_epochs: 1000
 learning_rate: 3.0e-4
 weight_decay: 1.0e-7

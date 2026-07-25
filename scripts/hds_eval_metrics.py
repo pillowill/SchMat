@@ -44,10 +44,12 @@ def parse_structure_from_cif_str(cif_str: str) -> Optional[Structure]:
         warnings.filterwarnings("ignore", category=UserWarning, module=r"pymatgen\\..*")
         parser = CifParser(StringIO(cif_str))
         try:
-            return parser.parse_structures(primitive=True)[0]
+            # Reference CIFs are evaluated in the same full-cell
+            # representation used by prompts, HDS and diffusion targets.
+            return parser.parse_structures(primitive=False)[0]
         except Exception:
             try:
-                return parser.get_structures()[0]
+                return parser.get_structures(primitive=False)[0]
             except Exception:
                 return None
 

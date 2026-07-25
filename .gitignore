@@ -1,6 +1,8 @@
 # Large/generated project artifacts kept outside source control.
 /dataset/
 /docs/
+/experiments/
+/result/
 
 # Python bytecode and interpreter caches.
 __pycache__/
