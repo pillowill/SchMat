@@ -877,10 +877,12 @@ def update_csp_metrics(
         {"symbol": symbol, "count": count} for symbol, count in reference.composition_counts
     ]
     if top["composition_counts"] != reference_composition:
-        raise ValueError(
-            f"Prompt/reference composition mismatch: prompt={top['composition_counts']}, "
-            f"reference={reference_composition}"
-        )
+        # Direct HDS artifacts created from primitive cells can legitimately
+        # disagree with full-cell CIF prompts. Generation remains valid because
+        # constrained decoding follows the prompt; only code/VQ comparisons are
+        # undefined across different compositions and must be excluded.
+        totals["reference_composition_mismatch"] += 1
+        return
     ref_global = reference.global_codes
     ref_local = reference.local_codes
     totals["global_slots"] += len(ref_global)
@@ -921,6 +923,10 @@ def finalize_csp_metrics(totals: Dict[str, float]) -> Dict[str, float]:
             "local_exact_match_rate": ratio("local_exact", "reference_prompts"),
             "candidate_top_k_coverage": ratio("topk_full_coverage", "reference_prompts"),
             "reference_prompt_count": totals["reference_prompts"],
+            "reference_composition_match_rate": (
+                totals["reference_prompts"] - totals["reference_composition_mismatch"]
+            ) / max(totals["reference_prompts"], 1),
+            "reference_composition_mismatch_count": int(totals["reference_composition_mismatch"]),
         })
     if totals["vq_cosine_prompts"]:
         metrics.update({
@@ -1010,6 +1016,7 @@ def main():
         "global_exact": 0,
         "local_exact": 0,
         "topk_full_coverage": 0,
+        "reference_composition_mismatch": 0,
         "global_vq_cosine_sum": 0.0,
         "local_vq_cosine_sum": 0.0,
         "hds_vq_cosine_sum": 0.0,
