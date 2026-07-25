@@ -166,6 +166,12 @@ class CrystalVQVAE(nn.Module):
         self.residual_attn_use_outer_aggregator = bool(residual_attn_use_outer_aggregator)
         self.stacked_vq_use_outer_aggregator = bool(stacked_vq_use_outer_aggregator)
         self.enable_residual_codebook_params = bool(enable_residual_codebook_params)
+        # The alpha-weighted ResidualVQ variants do not use an outer aggregator.
+        # Define these compatibility attributes for every VQ type nonetheless:
+        # older utility code may inspect them, while the HDS metric below must not
+        # depend on an encoder-side attention module.
+        self.global_aggregator = None
+        self.local_aggregator = None
         if residual_codebook_params is None:
             self.residual_codebook_params = {}
         elif isinstance(residual_codebook_params, dict):
@@ -261,10 +267,6 @@ class CrystalVQVAE(nn.Module):
                 codebook_size=codebook_size,
                 commitment_weight=commitment_weight,
             )
-
-            # 为了保持属性存在（以及不影响旧代码引用），这里置空聚合器
-            self.global_aggregator = None
-            self.local_aggregator = None
 
         # -------- Decoders --------
 
@@ -467,6 +469,42 @@ class CrystalVQVAE(nn.Module):
             return aggregator(codebook_vectors)  # (B, D)
         else:
             raise ValueError("ResidualVQ does not have get_codes_from_indices method.")
+
+    @torch.no_grad()
+    def get_hds_metric_embedding_from_indices(self, indices, is_global: bool = True) -> torch.Tensor:
+        """Return the deterministic, index-only VQ embedding used for HDS metrics.
+
+        HDS stores quantizer indices but not the encoder residual seen at each
+        alpha-weighted ``residual_attn`` stage. Consequently, its exact
+        encoder-conditioned alpha values cannot be reconstructed after
+        generation. For a fair generated-vs-reference comparison, this method
+        maps both HDSs into the same trained codebook space without fabricating
+        those unavailable residuals. Residual-style VQs therefore use the sum
+        of their selected stage codebook vectors; a vector VQ uses its selected
+        codebook vector directly.
+
+        This is intentionally separate from ``get_att_agg_output_from_indices``:
+        that method serves model paths which may request an outer aggregator,
+        whereas the HDS cosine metric must be fully determined by discrete codes.
+        """
+        vq_module = self.vq_global if is_global else self.vq_local
+
+        if self.vq_type == "vector":
+            if indices.dim() > 1:
+                indices = indices.squeeze(-1)
+            indices = indices.long()
+            if hasattr(vq_module, "get_codes_from_indices"):
+                return vq_module.get_codes_from_indices(indices)
+            for codebook_attr in ("_codebook", "codebook"):
+                if hasattr(vq_module, codebook_attr):
+                    codebook = getattr(vq_module, codebook_attr)
+                    if hasattr(codebook, "embed"):
+                        return codebook.embed[indices]
+            raise ValueError("VectorQuantize codebook access failed: could not locate embedding tensor.")
+
+        if not hasattr(vq_module, "get_output_from_indices"):
+            raise ValueError("Residual-style VQ does not expose index-to-output conversion.")
+        return vq_module.get_output_from_indices(indices)
 
     def get_codebook_vectors_from_indices(self, indices, is_global: bool = True) -> torch.Tensor:
         """

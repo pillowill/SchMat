@@ -824,16 +824,21 @@ def accumulate_vq_cosines(
     vq_model,
     device: torch.device,
 ) -> None:
-    """Compare deterministic index-derived VQ conditions for the top candidate."""
+    """Compare top-candidate and reference HDS in deterministic VQ codebook space.
+
+    Alpha-weighted Attn-RVQ gates depend on encoder residuals, which are absent
+    from an HDS. The model helper therefore uses only the selected codebook
+    vectors for both sides rather than attempting to recreate unavailable gates.
+    """
     predicted_global = torch.tensor([candidate["global_codes"]], dtype=torch.long, device=device)
     reference_global = torch.tensor([reference.global_codes], dtype=torch.long, device=device)
     predicted_local = torch.tensor(candidate["local_codes"], dtype=torch.long, device=device)
     reference_local = torch.tensor(reference.local_codes, dtype=torch.long, device=device)
 
-    predicted_global_vq = vq_model.get_att_agg_output_from_indices(predicted_global, is_global=True)
-    reference_global_vq = vq_model.get_att_agg_output_from_indices(reference_global, is_global=True)
-    predicted_local_vq = vq_model.get_att_agg_output_from_indices(predicted_local, is_global=False)
-    reference_local_vq = vq_model.get_att_agg_output_from_indices(reference_local, is_global=False)
+    predicted_global_vq = vq_model.get_hds_metric_embedding_from_indices(predicted_global, is_global=True)
+    reference_global_vq = vq_model.get_hds_metric_embedding_from_indices(reference_global, is_global=True)
+    predicted_local_vq = vq_model.get_hds_metric_embedding_from_indices(predicted_local, is_global=False)
+    reference_local_vq = vq_model.get_hds_metric_embedding_from_indices(reference_local, is_global=False)
 
     global_cosine = F.cosine_similarity(predicted_global_vq, reference_global_vq, dim=-1).mean()
     local_cosine = F.cosine_similarity(predicted_local_vq, reference_local_vq, dim=-1).mean()
