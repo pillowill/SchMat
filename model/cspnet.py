@@ -187,6 +187,7 @@ class CSPNet(nn.Module):
             use_multiscale_film=False,
             local_film_end_layer=None,
             global_film_start_layer=None,
+            hds_condition_mode="full",
     ):
         super(CSPNet, self).__init__()
 
@@ -195,6 +196,17 @@ class CSPNet(nn.Module):
         self.max_atoms = max_atoms  # 保存以便 one-hot 时使用
         self.cond_guided = cond_guided
         self.use_multiscale_film = bool(use_multiscale_film)
+        valid_hds_condition_modes = {"full", "global_only", "local_only", "none"}
+        self.hds_condition_mode = str(hds_condition_mode).strip().lower()
+        if self.hds_condition_mode not in valid_hds_condition_modes:
+            raise ValueError(
+                "hds_condition_mode must be one of "
+                f"{sorted(valid_hds_condition_modes)}, got {hds_condition_mode!r}"
+            )
+        # The complete HDS is still decoded and looked up before CSPNet. These
+        # flags only gate the final FiLM injections at the diffusion interface.
+        self.use_global_hds_condition = self.hds_condition_mode in {"full", "global_only"}
+        self.use_local_hds_condition = self.hds_condition_mode in {"full", "local_only"}
         if self.smooth:
             self.node_embedding = nn.Linear(max_atoms, hidden_dim)
         else:
@@ -431,12 +443,22 @@ class CSPNet(nn.Module):
         """
         # 1. 条件建模与Diffusion建模进行结合(重点)，后续需要完成无条件的Diffusion
         # 基础局部 FiLM（兼容旧行为）
-        if (not self.use_multiscale_film) and t_per_atom is not None and cond_local_semantic is not None:
+        if (
+            self.use_local_hds_condition
+            and (not self.use_multiscale_film)
+            and t_per_atom is not None
+            and cond_local_semantic is not None
+        ):
             node_features = self.local_film_layer(
                 node_features, time_embeds=t_per_atom, cond_embeds=cond_local_semantic
             )
         for i in range(0, self.num_layers):
-            if self.use_multiscale_film and t_per_atom is not None and cond_local_semantic is not None:
+            if (
+                self.use_local_hds_condition
+                and self.use_multiscale_film
+                and t_per_atom is not None
+                and cond_local_semantic is not None
+            ):
                 if i < self.local_film_end_layer:
                     node_features = self.local_film_layers[i](
                         node_features, time_embeds=t_per_atom, cond_embeds=cond_local_semantic
@@ -450,7 +472,12 @@ class CSPNet(nn.Module):
                 frac_diff=frac_diff
             )
 
-            if self.use_multiscale_film and t is not None and cond_global_semantic is not None:
+            if (
+                self.use_global_hds_condition
+                and self.use_multiscale_film
+                and t is not None
+                and cond_global_semantic is not None
+            ):
                 if i >= self.global_film_start_layer:
                     graph_features_i = scatter(node_features, node2graph, dim=0, reduce='mean')
                     graph_features_i = self.global_film_layers[i](
@@ -464,12 +491,17 @@ class CSPNet(nn.Module):
             node_features = self.final_layer_norm(node_features)
 
         # 应用 FiLM 层进行条件注入到全局特征，同样对应于条件扩散
-        if t_per_atom is not None and cond_global_semantic is not None:
+        if t_per_atom is not None:
             coord_out = self.coord_out(node_features)
             graph_features = scatter(node_features, node2graph, dim=0, reduce='mean')
 
 
-            if self.cond_guided and (not self.use_multiscale_film):
+            if (
+                self.cond_guided
+                and self.use_global_hds_condition
+                and (not self.use_multiscale_film)
+                and cond_global_semantic is not None
+            ):
                 graph_features = self.global_film_layer(
                     graph_features, time_embeds=t, cond_embeds=cond_global_semantic
                 )
@@ -491,4 +523,3 @@ class CSPNet(nn.Module):
         else:
             graph_features = scatter(node_features, node2graph, dim=0, reduce='mean')
             return local_features, graph_features
-

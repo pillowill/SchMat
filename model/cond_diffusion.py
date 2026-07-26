@@ -137,6 +137,7 @@ class CondDiffusion(nn.Module):
         # 当 diffuse_atom_types=False 时，强制 pred_atom_types=False（原子类型固定，不需要预测）
         if not self.diffuse_atom_types:
             pred_atom_types_config = False
+        self.hds_condition_mode = str(_config.get("hds_condition_mode", "full")).strip().lower()
         self.decoder = CSPNet(
             hidden_dim=_config["hidden_dim"],
             cond_dim=_config.get("cond_dim", 256) if self.cond_guide else 0,
@@ -157,7 +158,9 @@ class CondDiffusion(nn.Module):
             use_multiscale_film=bool(_config.get("use_multiscale_film", False)),
             local_film_end_layer=_config.get("local_film_end_layer", None),
             global_film_start_layer=_config.get("global_film_start_layer", None),
+            hds_condition_mode=self.hds_condition_mode,
         )
+        print(f"[HDS condition] diffusion interface mode={self.hds_condition_mode}")
         # set cost for loss
         self.cost_atom_types = _config.get("cost_atom_types", 1.0)
         self.cost_lattice = _config.get("cost_lattice", 1.0)
