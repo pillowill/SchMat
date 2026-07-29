@@ -1,0 +1,82 @@
+# MP-20 full-cell HDS fusion experiment.
+# This intentionally matches the established direct-train/predicted-validation
+# MP-20 baseline; the only model-side change is gated bidirectional HDS fusion.
+
+wandb:
+  project: cond_diffusion
+  run_name: mp_20_fullcell_e2_gated_bidirectional_cfgdrop
+
+# Data and cached HDS conditions
+use_single_csv: false
+data_path: dataset/mp_20
+train_csv: train.csv
+val_csv: val.csv
+test_csv: test.csv
+return_test: false
+property: band_gap
+random_seed: 42
+train_batch_size: 256
+val_batch_size: 128
+test_batch_size: 128
+workers: 0
+pin_memory: true
+
+# Full-cell Attn-RVQ and the already prepared E2 HDS conditions.
+pretrained_vqvae_path: experiments/mp_20/k256_lr3e-4_fullcell_attn_rvq/checkpoints/best_model.pth
+pretrained_vqvae_config: config/attn_rvq/train_cryvqvae_mp_20_k256_lr3e-4.yaml
+direct_indices_path_train: experiments/mp_20/k256_lr3e-4_fullcell_cond_diffusion_hds/conditions/direct_train_indices.pkl.gz
+direct_indices_path_val: experiments/mp_20/k256_lr3e-4_fullcell_cond_diffusion_hds/conditions/direct_val_indices.pkl.gz
+predicted_indices_path_train: experiments/mp_20/k256_lr3e-4_fullcell_cond_diffusion_hds/conditions/predicted_rank0_train_indices.pkl.gz
+predicted_indices_path_val: experiments/mp_20/k256_lr3e-4_fullcell_cond_diffusion_hds/conditions/predicted_rank0_val_indices.pkl.gz
+predicted_hds_ratio: 0.0
+predicted_hds_candidate_rank: 0
+hds_mix_seed: 42
+validation_hds_source: predicted
+
+# Optimisation
+learning_rate: 1.0e-3
+weight_decay: 0.0
+min_lr: 1.0e-7
+num_epochs: 1000
+grad_clip: 1.0
+scheduler: cosine
+cosine_T_max: null
+early_stopping: false
+save_every: 500
+
+# Diffusion process
+timesteps: 1000
+beta_schedule: cosine
+diffuse_atom_types: false
+max_atoms: 104
+d3pm_hybrid_coeff: 1.0
+
+# HDS CFG: graph-level shared Global/Local dropout is implemented in code.
+cond_guide: true
+cond_drop_prob: 0.1
+property_cond_enabled: false
+
+# CSPNet and HDS fusion
+time_dim: 512
+hidden_dim: 512
+cond_dim: 512
+num_layers: 6
+act_fn: silu
+dis_emb: sin
+num_freqs: 128
+edge_style: fc
+cutoff: 6.0
+max_neighbors: 20
+ln: true
+ip: true
+smooth: false
+pred_atom_types: false
+cost_atom_types: 1.0
+cost_lattice: 1.0
+cost_coords: 1.0
+
+# Retained only for legacy compatibility.  This mode bypasses all legacy FiLM
+# injections and uses one gated fusion block after CSP layers 0 and 1.
+use_multiscale_film: true
+hds_fusion_mode: gated_bidirectional
+hds_fusion_layer: 1
