@@ -154,6 +154,16 @@ $$
 
 建议先用一个 fusion block 插入中层，而不是每层重复注入。若一个 block 有收益，再消融比较 early/middle/late placement 和 block 数量。
 
+实现接口：在现有 `CSPNet` 中使用以下配置启用该路径；不新增模型或训练脚本。
+
+```yaml
+hds_fusion_mode: gated_bidirectional
+# 6 层 CSPNet 的默认值为 1，即在第 0、1 个 CSP layer 后融合。
+hds_fusion_layer: 1
+```
+
+默认 `hds_fusion_mode: legacy_multiscale_film` 保持原有 FiLM 行为，可继续加载并复现实验。`gated_bidirectional` 是新的架构，不能直接加载 legacy diffusion checkpoint 后进行等价推理，必须重新训练对应的条件扩散模型。
+
 #### E. 训练与诊断
 
 先修复 graph-level CFG，再训练融合模型。应同时记录：

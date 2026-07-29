@@ -164,6 +164,132 @@ class CSPLayer(nn.Module):
         node_output = self.node_model(node_features, edge_features, edge_index)
         return node_input + node_output
 
+
+class GlobalLocalFusionBlock(nn.Module):
+    """Bidirectionally fuse graph-level and site-level HDS conditions.
+
+    The legacy multiscale FiLM path injects local conditions before early CSP
+    layers and broadcasts a graph-level feature after late layers.  This block
+    instead keeps an explicit global token, gates both condition branches at
+    each site, and updates the global token by attending over the conditioned
+    node/local tokens of its own graph.
+    """
+
+    def __init__(self, hidden_dim: int, time_dim: int):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.time_dim = time_dim
+
+        self.global_norm = nn.LayerNorm(hidden_dim)
+        self.local_norm = nn.LayerNorm(hidden_dim)
+        self.local_to_node = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.global_to_node = nn.Linear(hidden_dim, hidden_dim, bias=False)
+
+        # Two site-wise gates: one for the local residual and one for the
+        # graph/global residual.  The time embedding lets their strength vary
+        # across the diffusion trajectory.
+        gate_input_dim = hidden_dim * 3 + time_dim
+        self.node_gate = nn.Sequential(
+            nn.Linear(gate_input_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, 2),
+        )
+
+        # Global token queries the conditioned sites.  The local condition is
+        # part of key/value features, so the attention explicitly depends on
+        # Global/Local correspondence rather than only node mean pooling.
+        self.pool_query = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.pool_key = nn.Linear(hidden_dim * 2, hidden_dim, bias=False)
+        self.pool_value = nn.Linear(hidden_dim * 2, hidden_dim, bias=False)
+        self.global_update = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.global_update_norm = nn.LayerNorm(hidden_dim)
+
+        # Sigmoid(-4) is a small but non-zero residual scale.  It keeps a newly
+        # enabled condition path from overwhelming the CSP backbone at startup
+        # while allowing all three routes to learn independently.
+        self.local_residual_logit = nn.Parameter(torch.tensor(-4.0))
+        self.global_residual_logit = nn.Parameter(torch.tensor(-4.0))
+        self.global_update_logit = nn.Parameter(torch.tensor(-4.0))
+
+    def forward(
+        self,
+        node_features: torch.Tensor,
+        global_semantic: torch.Tensor = None,
+        local_semantic: torch.Tensor = None,
+        t_per_atom: torch.Tensor = None,
+        node2graph: torch.Tensor = None,
+        use_global: bool = True,
+        use_local: bool = True,
+    ):
+        """Return updated node features and an optional updated global token."""
+        if node2graph is None:
+            raise ValueError("node2graph is required for GlobalLocalFusionBlock")
+
+        num_nodes = node_features.shape[0]
+        zero_nodes = torch.zeros_like(node_features)
+        local_tokens = (
+            self.local_norm(local_semantic)
+            if use_local and local_semantic is not None
+            else zero_nodes
+        )
+        global_token = (
+            self.global_norm(global_semantic)
+            if use_global and global_semantic is not None
+            else None
+        )
+        global_nodes = global_token[node2graph] if global_token is not None else zero_nodes
+
+        if t_per_atom is None:
+            time_nodes = node_features.new_zeros((num_nodes, self.time_dim))
+        else:
+            time_nodes = t_per_atom
+        gate_input = torch.cat(
+            [node_features, local_tokens, global_nodes, time_nodes], dim=-1
+        )
+        local_gate, global_gate = torch.sigmoid(self.node_gate(gate_input)).unbind(dim=-1)
+
+        node_update = torch.zeros_like(node_features)
+        if use_local and local_semantic is not None:
+            node_update = node_update + (
+                torch.sigmoid(self.local_residual_logit)
+                * local_gate[:, None]
+                * self.local_to_node(local_tokens)
+            )
+        if global_token is not None:
+            node_update = node_update + (
+                torch.sigmoid(self.global_residual_logit)
+                * global_gate[:, None]
+                * self.global_to_node(global_nodes)
+            )
+        node_features = node_features + node_update
+
+        if global_token is None:
+            return node_features, None
+
+        pool_inputs = torch.cat([node_features, local_tokens], dim=-1)
+        queries = self.pool_query(global_token)[node2graph]
+        keys = self.pool_key(pool_inputs)
+        values = self.pool_value(pool_inputs)
+        attention_logits = (queries * keys).sum(dim=-1) / math.sqrt(self.hidden_dim)
+        attention_weights = scatter_softmax(attention_logits, node2graph, dim=0)
+        pooled_sites = scatter(
+            attention_weights[:, None] * values,
+            node2graph,
+            dim=0,
+            reduce='sum',
+            dim_size=global_token.shape[0],
+        )
+        global_token = self.global_update_norm(
+            global_token
+            + torch.sigmoid(self.global_update_logit) * self.global_update(pooled_sites)
+        )
+        return node_features, global_token
+
+
 class CSPNet(nn.Module):
 
     def __init__(
@@ -188,6 +314,8 @@ class CSPNet(nn.Module):
             local_film_end_layer=None,
             global_film_start_layer=None,
             hds_condition_mode="full",
+            hds_fusion_mode="legacy_multiscale_film",
+            hds_fusion_layer=None,
     ):
         super(CSPNet, self).__init__()
 
@@ -196,6 +324,18 @@ class CSPNet(nn.Module):
         self.max_atoms = max_atoms  # 保存以便 one-hot 时使用
         self.cond_guided = cond_guided
         self.use_multiscale_film = bool(use_multiscale_film)
+        valid_hds_fusion_modes = {"legacy_multiscale_film", "gated_bidirectional"}
+        self.hds_fusion_mode = str(hds_fusion_mode).strip().lower()
+        if self.hds_fusion_mode not in valid_hds_fusion_modes:
+            raise ValueError(
+                "hds_fusion_mode must be one of "
+                f"{sorted(valid_hds_fusion_modes)}, got {hds_fusion_mode!r}"
+            )
+        self.use_gated_hds_fusion = self.hds_fusion_mode == "gated_bidirectional"
+        if self.use_gated_hds_fusion and not self.cond_guided:
+            raise ValueError(
+                "hds_fusion_mode='gated_bidirectional' requires cond_guided=True"
+            )
         valid_hds_condition_modes = {"full", "global_only", "local_only", "none"}
         self.hds_condition_mode = str(hds_condition_mode).strip().lower()
         if self.hds_condition_mode not in valid_hds_condition_modes:
@@ -227,6 +367,21 @@ class CSPNet(nn.Module):
             # 输出：条件向量 (cond_dim)
             self.global_sem_proj = nn.Linear(cond_dim, hidden_dim)
             self.local_sem_proj = nn.Linear(cond_dim, hidden_dim)
+            if self.use_gated_hds_fusion:
+                self.hds_fusion_block = GlobalLocalFusionBlock(hidden_dim, time_dim)
+                self.lattice_hds_fuse = nn.Sequential(
+                    nn.LayerNorm(hidden_dim * 2),
+                    nn.Linear(hidden_dim * 2, hidden_dim),
+                    nn.SiLU(),
+                    nn.Linear(hidden_dim, hidden_dim),
+                )
+                self.lattice_hds_fuse_logit = nn.Parameter(torch.tensor(-4.0))
+            else:
+                self.hds_fusion_block = None
+                self.lattice_hds_fuse = None
+        else:
+            self.hds_fusion_block = None
+            self.lattice_hds_fuse = None
         self.coords_embedding = nn.Linear(3, hidden_dim)
         self.atom_latent_emb = nn.Linear(hidden_dim * 2, hidden_dim)
         if act_fn == 'silu':
@@ -246,6 +401,17 @@ class CSPNet(nn.Module):
             global_film_start_layer = max(0, num_layers // 2)
         self.local_film_end_layer = int(local_film_end_layer)
         self.global_film_start_layer = int(global_film_start_layer)
+        if hds_fusion_layer is None:
+            # For six layers this runs after layers 0 and 1: local geometry has
+            # been refined, while later CSP layers can still jointly propagate
+            # the fused representation.
+            hds_fusion_layer = max(0, num_layers // 3 - 1)
+        self.hds_fusion_layer = int(hds_fusion_layer)
+        if not 0 <= self.hds_fusion_layer < num_layers:
+            raise ValueError(
+                f"hds_fusion_layer must be in [0, {num_layers - 1}], "
+                f"got {self.hds_fusion_layer}"
+            )
         self.coord_out = nn.Linear(hidden_dim, 3, bias=False)
         self.lattice_out = nn.Linear(hidden_dim, 9, bias=False)
         # type_out 的创建应该同时依赖于 cond_guided 和 pred_atom_types
@@ -398,6 +564,7 @@ class CSPNet(nn.Module):
         # 此处cond_inputs传入的已经是[cond_vq_vector_g, cond_vq_vector_l]，所以不需要再进行转换
         cond_global_semantic = None
         cond_local_semantic = None
+        fused_global_token = None
         edges, frac_diff = self.gen_edges(num_atoms, frac_coords, lattices, node2graph)
         edge2graph = node2graph[edges[0]]
         if self.smooth:
@@ -446,6 +613,7 @@ class CSPNet(nn.Module):
         if (
             self.use_local_hds_condition
             and (not self.use_multiscale_film)
+            and (not self.use_gated_hds_fusion)
             and t_per_atom is not None
             and cond_local_semantic is not None
         ):
@@ -456,6 +624,7 @@ class CSPNet(nn.Module):
             if (
                 self.use_local_hds_condition
                 and self.use_multiscale_film
+                and (not self.use_gated_hds_fusion)
                 and t_per_atom is not None
                 and cond_local_semantic is not None
             ):
@@ -473,8 +642,25 @@ class CSPNet(nn.Module):
             )
 
             if (
+                self.use_gated_hds_fusion
+                and i == self.hds_fusion_layer
+                and t_per_atom is not None
+                and self.hds_fusion_block is not None
+            ):
+                node_features, fused_global_token = self.hds_fusion_block(
+                    node_features=node_features,
+                    global_semantic=cond_global_semantic,
+                    local_semantic=cond_local_semantic,
+                    t_per_atom=t_per_atom,
+                    node2graph=node2graph,
+                    use_global=self.use_global_hds_condition,
+                    use_local=self.use_local_hds_condition,
+                )
+
+            if (
                 self.use_global_hds_condition
                 and self.use_multiscale_film
+                and (not self.use_gated_hds_fusion)
                 and t is not None
                 and cond_global_semantic is not None
             ):
@@ -500,10 +686,22 @@ class CSPNet(nn.Module):
                 self.cond_guided
                 and self.use_global_hds_condition
                 and (not self.use_multiscale_film)
+                and (not self.use_gated_hds_fusion)
                 and cond_global_semantic is not None
             ):
                 graph_features = self.global_film_layer(
                     graph_features, time_embeds=t, cond_embeds=cond_global_semantic
+                )
+            if (
+                self.use_gated_hds_fusion
+                and fused_global_token is not None
+                and self.lattice_hds_fuse is not None
+            ):
+                lattice_condition = self.lattice_hds_fuse(
+                    torch.cat([graph_features, fused_global_token], dim=-1)
+                )
+                graph_features = graph_features + (
+                    torch.sigmoid(self.lattice_hds_fuse_logit) * lattice_condition
                 )
             lattice_out = self.lattice_out(graph_features)
             lattice_out = lattice_out.view(-1, 3, 3)

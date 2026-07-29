@@ -159,8 +159,14 @@ class CondDiffusion(nn.Module):
             local_film_end_layer=_config.get("local_film_end_layer", None),
             global_film_start_layer=_config.get("global_film_start_layer", None),
             hds_condition_mode=self.hds_condition_mode,
+            hds_fusion_mode=_config.get("hds_fusion_mode", "legacy_multiscale_film"),
+            hds_fusion_layer=_config.get("hds_fusion_layer", None),
         )
-        print(f"[HDS condition] diffusion interface mode={self.hds_condition_mode}")
+        print(
+            "[HDS condition] "
+            f"interface={self.hds_condition_mode}, "
+            f"fusion={self.decoder.hds_fusion_mode}"
+        )
         # set cost for loss
         self.cost_atom_types = _config.get("cost_atom_types", 1.0)
         self.cost_lattice = _config.get("cost_lattice", 1.0)
