@@ -191,7 +191,27 @@ class CondDiffusion(nn.Module):
         prop_cond = torch.where(keep_mask[:, None], prop_cond, self.null_prop.unsqueeze(0).expand_as(prop_cond))
         return prop_cond
 
-    def get_vq_vector(self, batch_vq_indices, cond_drop_prob, device):
+    @staticmethod
+    def _sample_graph_condition_keep_mask(batch_size, cond_drop_prob, device):
+        """Sample one CFG keep/drop decision for each crystal graph.
+
+        Classifier-free guidance is evaluated between two endpoint states:
+        the complete HDS condition and the fully null HDS condition.  The mask
+        must therefore be sampled at graph level and shared by the global code
+        and every local/site code belonging to that graph.
+        """
+        if not 0.0 <= cond_drop_prob <= 1.0:
+            raise ValueError("cond_drop_prob must be in [0, 1]")
+        return prob_mask_like((batch_size,), 1.0 - cond_drop_prob, device)
+
+    def get_vq_vector(
+        self,
+        batch_vq_indices,
+        cond_drop_prob,
+        device,
+        node2graph=None,
+        graph_keep_mask=None,
+    ):
         """
         从 VQ indices 获取连续向量并应用条件 drop
 
@@ -203,6 +223,12 @@ class CondDiffusion(nn.Module):
             条件 drop 概率（用于 classifier-free guidance）
         device : torch.device
             设备
+        node2graph : torch.Tensor, optional
+            每个 local/site condition 所属的晶体编号，shape 为
+            ``(total_atoms,)``。当一个晶体包含多个 local conditions 时必须提供。
+        graph_keep_mask : torch.Tensor, optional
+            可选的确定性 graph-level keep mask，主要用于复用或测试。未提供时根据
+            ``cond_drop_prob`` 为每个晶体采样一次。
 
         Returns
         -------
@@ -229,22 +255,56 @@ class CondDiffusion(nn.Module):
         batch_size_g = batch_vq_vector_g.shape[0]
         batch_size_l = batch_vq_vector_l.shape[0]
 
-        # 条件 drop（用于 classifier-free guidance）
-        cond_keep_mask_g = prob_mask_like(
-            (batch_size_g,), 1.0 - cond_drop_prob, device
-        )  # (batch_size,)
-        cond_keep_mask_l = prob_mask_like(
-            (batch_size_l,), 1.0 - cond_drop_prob, device
-        )  # (total_atoms,)
+        # CFG 必须以整个晶体为单位 drop：同一晶体的 global 和所有 local
+        # conditions 共享一个 mask。原先逐原子独立采样会使 all-null 状态的
+        # 概率变为 p^(N+1)，与推理时显式使用的全 null 分支不一致。
+        if graph_keep_mask is None:
+            graph_keep_mask = self._sample_graph_condition_keep_mask(
+                batch_size_g, cond_drop_prob, device
+            )
+        else:
+            graph_keep_mask = graph_keep_mask.to(device=device, dtype=torch.bool).view(-1)
+            if graph_keep_mask.numel() != batch_size_g:
+                raise ValueError(
+                    "graph_keep_mask length must equal the number of crystal graphs: "
+                    f"got {graph_keep_mask.numel()} and {batch_size_g}"
+                )
+
+        if node2graph is None:
+            if batch_size_l != batch_size_g:
+                raise ValueError(
+                    "node2graph is required for graph-level CFG dropout when the number "
+                    "of local conditions differs from the number of crystal graphs"
+                )
+            local_keep_mask = graph_keep_mask
+        else:
+            node2graph = node2graph.to(device=device, dtype=torch.long).view(-1)
+            if node2graph.numel() != batch_size_l:
+                raise ValueError(
+                    "node2graph length must equal the number of local conditions: "
+                    f"got {node2graph.numel()} and {batch_size_l}"
+                )
+            # CPU-side validation catches malformed test/input data without adding
+            # a GPU-to-CPU synchronization to every training batch. Production
+            # mappings come from PyG ``batch.batch``, which already follows this range.
+            if node2graph.numel() > 0 and node2graph.device.type == "cpu":
+                graph_min = int(node2graph.min().item())
+                graph_max = int(node2graph.max().item())
+                if graph_min < 0 or graph_max >= batch_size_g:
+                    raise ValueError(
+                        "node2graph contains an out-of-range graph index: "
+                        f"min={graph_min}, max={graph_max}, num_graphs={batch_size_g}"
+                    )
+            local_keep_mask = graph_keep_mask[node2graph]
 
         # 对于被 drop 的条件，使用可学习的 null condition
         batch_vq_vector_g = torch.where(
-            cond_keep_mask_g[:, None],
+            graph_keep_mask[:, None],
             batch_vq_vector_g,
             self.null_vq_g.unsqueeze(0).expand_as(batch_vq_vector_g)
         )
         batch_vq_vector_l = torch.where(
-            cond_keep_mask_l[:, None],
+            local_keep_mask[:, None],
             batch_vq_vector_l,
             self.null_vq_l.unsqueeze(0).expand_as(batch_vq_vector_l)
         )
@@ -322,7 +382,12 @@ class CondDiffusion(nn.Module):
             if indices_g is None or indices_l is None:
                 raise ValueError("global_vq_indices/local_vq_indices cannot be None when cond_guide=True")
             cond_inputs = [indices_g, indices_l]
-            cond_inputs = list(self.get_vq_vector(cond_inputs, self.cond_drop_prob, device=device))
+            cond_inputs = list(self.get_vq_vector(
+                cond_inputs,
+                self.cond_drop_prob,
+                device=device,
+                node2graph=batch_idx,
+            ))
             if self.property_cond_enabled:
                 property_bins = getattr(batch, "property_bins", None)
                 prop_cond = self._get_property_cond(property_bins, self.property_cond_drop_prob, device=device)
@@ -534,11 +599,13 @@ class CondDiffusion(nn.Module):
                 cond_inputs[:2],
                 cond_drop_prob=0.0,
                 device=device,
+                node2graph=batch_idx,
             ))
             null_cond_vq_vectors = list(self.get_vq_vector(
                 cond_inputs[:2],
                 cond_drop_prob=1.0,
                 device=device,
+                node2graph=batch_idx,
             ))
             if self.property_cond_enabled:
                 prop_cond = self._get_property_cond(prop_ids, cond_drop_prob=0.0, device=device)
